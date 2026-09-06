@@ -34,6 +34,7 @@ SETTING_DEFAULTS: dict[str, float] = {
     "default_internal_weight_percent": 65.0,
     "default_external_weight_percent": 35.0,
     "default_dwelling_count": 1.0,
+    "default_gst_percent": 10.0,
     "stage_interior_prep_seal_percent": 30.0,
     "stage_interior_finish_coats_percent": 30.0,
     "stage_interior_cut_roll_doors_percent": 30.0,
@@ -255,6 +256,15 @@ def _render_rates_tab(st: Any) -> None:
             step=100.0,
             value=get_setting_float("default_production_target_per_day", SETTING_DEFAULTS["default_production_target_per_day"]),
         )
+        gst_percent = st.number_input(
+            "Default GST / tax rate %",
+            min_value=0.0,
+            max_value=100.0,
+            step=0.5,
+            value=get_setting_float("default_gst_percent", SETTING_DEFAULTS["default_gst_percent"]),
+            help="Snapshotted onto each new purchase order and supplier invoice when it is created. "
+            "Changing this does not alter the tax rate already recorded on existing documents.",
+        )
         save = st.form_submit_button("Save rate and forecast defaults", type="primary")
     if save:
         _save_settings(
@@ -263,6 +273,7 @@ def _render_rates_tab(st: Any) -> None:
                 "default_charge_out_hourly_rate": charge_rate,
                 "default_painter_day_hours": day_hours,
                 "default_production_target_per_day": production_target,
+                "default_gst_percent": gst_percent,
             }
         )
         _success("Rate and forecast defaults saved.")

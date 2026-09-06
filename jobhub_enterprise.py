@@ -88,6 +88,28 @@ def _execute(ctx: dict[str, Any], sql: str, params: tuple[Any, ...] = ()) -> Any
     return ctx["execute"](sql, params)
 
 
+def _default_gst_percent(ctx: dict[str, Any]) -> float:
+    """Currently configured tax rate for NEW documents.
+
+    Existing purchase_orders/supplier_invoices snapshot the rate that was in
+    effect at creation time in their own gst_percent column -- this function
+    must only be used to stamp that snapshot on a brand-new document, never
+    to recompute GST on an already-created one (that would retroactively
+    change historical job cost -- architecture decision #4/#5).
+    """
+    try:
+        df = _query(
+            ctx,
+            "SELECT setting_value FROM app_settings WHERE setting_key = ? LIMIT 1",
+            ("default_gst_percent",),
+        )
+        if df is not None and not df.empty:
+            return round(float(df.iloc[0]["setting_value"]), 4)
+    except Exception:
+        pass
+    return 10.0
+
+
 def _notify_management(
     ctx: dict[str, Any],
     event_type: str,
@@ -207,6 +229,7 @@ def ensure_enterprise_schema(connect: Callable[[], Any]) -> bool:
                 approved_by TEXT,
                 approved_at TEXT,
                 subtotal_ex_gst REAL DEFAULT 0,
+                gst_percent REAL DEFAULT 10,
                 gst_amount REAL DEFAULT 0,
                 total_inc_gst REAL DEFAULT 0,
                 notes TEXT,
@@ -250,6 +273,7 @@ def ensure_enterprise_schema(connect: Callable[[], Any]) -> bool:
                 due_date TEXT,
                 status TEXT DEFAULT 'Received',
                 subtotal_ex_gst REAL DEFAULT 0,
+                gst_percent REAL DEFAULT 10,
                 gst_amount REAL DEFAULT 0,
                 total_inc_gst REAL DEFAULT 0,
                 variance_ex_gst REAL DEFAULT 0,
@@ -333,6 +357,7 @@ def ensure_enterprise_schema(connect: Callable[[], Any]) -> bool:
             cur.execute(statement)
 
         _ensure_field_clock_gps_columns(conn)
+        _ensure_gst_percent_columns(conn)
 
         conn.commit()
         return True
@@ -373,6 +398,30 @@ def _ensure_field_clock_gps_columns(conn: Any) -> None:
                     cur.execute(
                         f"ALTER TABLE field_clock_entries ADD COLUMN {column} {definition}"
                     )
+            except Exception:
+                pass
+
+
+def _ensure_gst_percent_columns(conn: Any) -> None:
+    """Add a snapshotted gst_percent column to purchase_orders/supplier_invoices.
+
+    Architecture decision #5: remove the hardcoded 10% GST calculation and
+    introduce a configurable tax rate with document-level snapshots (the
+    Australian default may remain 10%). New databases already create these
+    columns in the DDL above; this migration keeps older installations
+    working, matching the same portable ADD COLUMN IF NOT EXISTS / PRAGMA
+    fallback pattern as _ensure_field_clock_gps_columns.
+    """
+    cur = conn.cursor()
+    for table in ("purchase_orders", "supplier_invoices"):
+        try:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS gst_percent REAL DEFAULT 10")
+        except Exception:
+            try:
+                cur.execute(f"PRAGMA table_info({table})")
+                existing = {row[1] for row in cur.fetchall()}
+                if "gst_percent" not in existing:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN gst_percent REAL DEFAULT 10")
             except Exception:
                 pass
 
@@ -958,7 +1007,13 @@ def _create_purchase_order(
         raise ValueError("At least one line with a description and quantity is required.")
 
     subtotal = round(sum(item["line_total"] for item in cleaned), 2)
-    gst = round(subtotal * 0.10, 2)
+    # Snapshot the currently configured tax rate onto this PO (architecture
+    # decision #5). A later change to the system default must not
+    # retroactively change what this document already recorded -- the same
+    # snapshot-at-creation approach estimate_working_sheets.gst_percent
+    # already uses for estimates.
+    gst_percent = _default_gst_percent(ctx)
+    gst = round(subtotal * gst_percent / 100, 2)
     total = round(subtotal + gst, 2)
     approved_by = user.get("username", "") if status != "Requested" else ""
     approved_at = _now() if approved_by else ""
@@ -971,11 +1026,11 @@ def _create_purchase_order(
             INSERT INTO purchase_orders
             (po_no, job_id, supplier, status, order_date, expected_date, requested_by,
              approved_by, approved_at, subtotal_ex_gst, gst_amount, total_inc_gst,
-             notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             gst_percent, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (po_no, job_id, supplier, status, order_date, expected_date, user.get("username", ""),
-             approved_by, approved_at, subtotal, gst, total, notes, _now(), _now()),
+             approved_by, approved_at, subtotal, gst, total, gst_percent, notes, _now(), _now()),
         )
         po_id = int(getattr(cur, "lastrowid", 0) or 0)
         if not po_id:
@@ -1199,7 +1254,8 @@ def render_procurement(ctx: dict[str, Any]) -> None:
         po_choices_df = _query(
             ctx,
             """
-            SELECT po.id, po.po_no, po.job_id, po.supplier, j.job_no, j.job_name, po.subtotal_ex_gst
+            SELECT po.id, po.po_no, po.job_id, po.supplier, j.job_no, j.job_name, po.subtotal_ex_gst,
+                   COALESCE(po.gst_percent, 10) AS gst_percent
             FROM purchase_orders po
             JOIN jobs j ON j.id = po.job_id
             WHERE po.status NOT IN ('Cancelled', 'Rejected')
@@ -1288,18 +1344,23 @@ def render_procurement(ctx: dict[str, Any]) -> None:
                         file_path = str(target)
                     conn = ctx["connect"]()
                     cur = conn.cursor()
-                    gst = round(invoice_subtotal * 0.10, 2)
+                    # Use the PO's own snapshotted rate, not a fresh read of
+                    # the current system default -- the invoice is for goods
+                    # ordered under the PO's terms, and the system default
+                    # may have changed since the PO was raised (decision #4/#5).
+                    invoice_gst_percent = _f(po_row["gst_percent"]) or 10.0
+                    gst = round(invoice_subtotal * invoice_gst_percent / 100, 2)
                     cur.execute(
                         """
                         INSERT INTO supplier_invoices
                         (invoice_no, supplier, job_id, purchase_order_id, invoice_date, due_date, status,
-                         subtotal_ex_gst, gst_amount, total_inc_gst, variance_ex_gst, file_path, notes,
+                         subtotal_ex_gst, gst_amount, total_inc_gst, gst_percent, variance_ex_gst, file_path, notes,
                          created_by, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (invoice_no.strip(), po_row["supplier"], int(po_row["job_id"]), po_id,
                          invoice_date, due_date, status, invoice_subtotal, gst, invoice_subtotal + gst,
-                         variance, file_path, notes, _user(ctx).get("username", ""), _now()),
+                         invoice_gst_percent, variance, file_path, notes, _user(ctx).get("username", ""), _now()),
                     )
                     invoice_id = int(getattr(cur, "lastrowid", 0) or 0)
                     if not invoice_id:
