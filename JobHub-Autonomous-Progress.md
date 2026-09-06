@@ -91,16 +91,19 @@ separate PlanReader 3D tool.
 | 1/2/3 | Procurement-authoritative Job Costs reconciliation | [#122](https://github.com/BrycePremierBW/Jobhub/pull/122) | Merged, verified |
 | 9 | Multi-tenant org-scoping design document | [#123](https://github.com/BrycePremierBW/Jobhub/pull/123) | Merged (design only, no migration implemented) |
 | — | Test infra: CI silently never ran ~120 tests in 28 files | [#124](https://github.com/BrycePremierBW/Jobhub/pull/124) | Merged, verified |
-| 10 | Dead `jobhub/pages` code: prove dead + inventory (port/remove not yet done) | [#125](https://github.com/BrycePremierBW/Jobhub/pull/125) | Merged (inventory only; see follow-up below) |
+| 10 | Dead `jobhub/pages` code: prove dead + inventory | [#125](https://github.com/BrycePremierBW/Jobhub/pull/125) | Merged (inventory only) |
+| 10 | Port lazy-section-selector fix: Job Register | [#127](https://github.com/BrycePremierBW/Jobhub/pull/127) | Merged, verified |
+| 10 | Port lazy-section-selector fix: Builders & Clients | [#128](https://github.com/BrycePremierBW/Jobhub/pull/128) | Merged, verified |
 | 11 | Palm Lakes migration | **BLOCKED — do not touch** | N/A |
 
 **Follow-ups identified but not yet actioned (queued):**
-- Port the lazy-section-selector fix (from dead `jobhub/pages/jobs.py` +
-  `jobhub/pages/builders_clients.py`) into the live Job Register and
-  Builders & Clients pages in `pb_jobhub_app.py`, which still eagerly
-  execute every `st.tabs()` section's queries on every load. Needs its
-  own REPRODUCE (real query-count measurement) + coordination with
-  `_TRACKED_TAB_SETS`. See `docs/DEAD_CODE_INVENTORY_DECISION_10.md`.
+- Removal of the 19 dead `jobhub/pages`/sibling modules themselves is
+  still deferred, per decision #10's own ordering, until the *rest* of
+  their contents (beyond the two lazy-render fixes already ported in
+  #127/#128) has been reviewed -- this session's inventory searched git
+  "fix" history specifically and found only those two; it did not rule
+  out other value in the remaining ~17 files (see
+  `docs/DEAD_CODE_INVENTORY_DECISION_10.md` section 5).
 - `enterprise_job_cost_dataframe()` in `jobhub_enterprise.py` still uses
   a `max()`-blend of material_entries/Procurement values rather than the
   additive PO-link-exclusion reconciliation applied to
@@ -511,3 +514,44 @@ touched no application code.
 
 **PR.** [#125](https://github.com/BrycePremierBW/Jobhub/pull/125) — merged,
 post-merge CI verified green.
+
+### 2026-09-06 — Decision #10 follow-up: port lazy-section-selector to Job Register and Builders & Clients
+
+**Reproduce.** Confirmed directly against `pb_jobhub_app.py` (per the
+decision #10 inventory) that both `elif menu == "Jobs":` (Job Register)
+and `elif menu == "Builders & Clients":` still used eager `st.tabs()`
+with every tab's body -- and every DB query inside it -- executing on
+every rerun regardless of which tab was visible. Wrote
+`tests/test_job_register_lazy_sections.py` and
+`tests/test_builders_clients_lazy_sections.py`, extracting the real
+blocks and running them with recording fakes; 8/9 and 6/7 assertions
+respectively fail against pre-fix code (mostly via the old `st.tabs()`
+unpack shape not matching the new lazy-selector fakes at all --
+confirming the two code paths are structurally different, not just
+differently worded).
+
+**Fix.** Converted both blocks' `st.tabs([...])` + `with tab_x:` headers
+to `st.radio(key=..., horizontal=True, label_visibility="collapsed")` +
+`if/elif section == "...":` -- a pure header-level change, zero lines of
+body logic touched in either page. Job Register's shared
+`get_builder_options()`/`get_product_supplier_options()` eager calls
+(previously run once at the top for all six sections) now run only
+inside the three sections that use them (Add Job, Edit Job, Search by
+Builder), matching exactly how the dead `jobhub/pages/jobs.py`'s own
+port scoped the same lookups. Builders & Clients needed no lookup
+redistribution -- each of its five sections already ran its own
+independent query. Removed both pages' now-dead entries from
+`navigation_state_guard._TRACKED_TAB_SETS` (a radio with a `key`
+persists its selection across reruns natively, unlike `st.tabs()`, which
+is why the guard existed for these two call sites in the first place);
+`tests/test_navigation_tab_coverage.py`'s own drift-detection confirmed
+no tracked entry was left dangling after either removal.
+
+**Tests.** Both new test files pass 9/9 assertions against the fix;
+`test_navigation_tab_coverage.py` (3/3) confirms the guard list stays in
+sync. Full suite: 712 tests green after both PRs. Ruff clean. Smoke test
+renders all 33 routes (including both converted pages) after each PR.
+
+**PR.** [#127](https://github.com/BrycePremierBW/Jobhub/pull/127) (Job
+Register), [#128](https://github.com/BrycePremierBW/Jobhub/pull/128)
+(Builders & Clients) — both merged, post-merge CI verified green.
