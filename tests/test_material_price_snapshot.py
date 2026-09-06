@@ -61,6 +61,18 @@ class MaterialPriceSnapshotAggregationTests(unittest.TestCase):
             "CREATE TABLE material_entries (id INTEGER PRIMARY KEY, job_id INTEGER, product_id INTEGER, "
             "qty_required REAL, qty_received REAL, custom_unit_price REAL, price_snapshot REAL)"
         )
+        # Empty but present: the materials query now excludes material_entries
+        # rows already linked to an active PO (architecture decisions #1-#3,
+        # see test_material_price_snapshot vs.
+        # test_procurement_authoritative_job_costs for that behaviour) -- none
+        # of this test's fixture rows are PO-linked, but the query still joins
+        # against these tables so they must exist.
+        self.conn.execute(
+            "CREATE TABLE purchase_orders (id INTEGER PRIMARY KEY, status TEXT)"
+        )
+        self.conn.execute(
+            "CREATE TABLE purchase_order_lines (id INTEGER PRIMARY KEY, purchase_order_id INTEGER, material_entry_id INTEGER)"
+        )
         self.conn.commit()
         self.query_source = _extract_materials_query()
 
@@ -84,7 +96,7 @@ class MaterialPriceSnapshotAggregationTests(unittest.TestCase):
         self.conn.commit()
 
         result = self._run_materials_query().set_index("job_id")
-        self.assertEqual(result.loc[1, "committed_material_cost"], 200.0)
+        self.assertEqual(result.loc[1, "non_po_committed_material_cost"], 200.0)
 
         # The catalog price changes after the order was placed.
         self.conn.execute("UPDATE products SET price_ex_gst = 999.0 WHERE id = 1")
@@ -92,7 +104,7 @@ class MaterialPriceSnapshotAggregationTests(unittest.TestCase):
 
         result_after_price_change = self._run_materials_query().set_index("job_id")
         self.assertEqual(
-            result_after_price_change.loc[1, "committed_material_cost"], 200.0,
+            result_after_price_change.loc[1, "non_po_committed_material_cost"], 200.0,
             "Editing the live catalog price must not retroactively change an already-recorded job's material cost",
         )
 
@@ -105,7 +117,7 @@ class MaterialPriceSnapshotAggregationTests(unittest.TestCase):
         self.conn.commit()
         result = self._run_materials_query().set_index("job_id")
         self.assertEqual(
-            result.loc[1, "committed_material_cost"], 500.0,
+            result.loc[1, "non_po_committed_material_cost"], 500.0,
             "A row created before this migration (no snapshot) should keep using the live price, as before",
         )
 
@@ -117,7 +129,7 @@ class MaterialPriceSnapshotAggregationTests(unittest.TestCase):
         )
         self.conn.commit()
         result = self._run_materials_query().set_index("job_id")
-        self.assertEqual(result.loc[1, "committed_material_cost"], 50.0)
+        self.assertEqual(result.loc[1, "non_po_committed_material_cost"], 50.0)
 
 
 class MaterialImportPriceSnapshotComputationTests(unittest.TestCase):

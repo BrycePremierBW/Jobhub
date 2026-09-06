@@ -591,14 +591,32 @@ def enterprise_job_cost_dataframe(ctx: dict[str, Any]) -> pd.DataFrame:
         GROUP BY w.job_id
         """,
     )
+    # Procurement (purchase_orders/supplier_invoices, queried below) is the
+    # authoritative $ source for any material_entries row already linked to
+    # an active PO -- material_entries only contributes the remaining
+    # non-PO/manual cost, same reconciliation as
+    # job_cost_summary_dataframe()/pb_job_cost_frame() in pb_jobhub_app.py
+    # (architecture decisions #1-#3). Without the po_link exclusion below, a
+    # converted line's cost would be counted twice: once here from
+    # material_entries and once from the PO's own subtotal.
     materials = _query(
         ctx,
         """
         SELECT m.job_id,
-               COALESCE(SUM(COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS committed_material_cost,
-               COALESCE(SUM(COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS received_material_cost
+               COALESCE(SUM(CASE WHEN po_link.material_entry_id IS NULL
+                   THEN COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)
+                   ELSE 0 END), 0) AS non_po_committed_material_cost,
+               COALESCE(SUM(CASE WHEN po_link.material_entry_id IS NULL
+                   THEN COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)
+                   ELSE 0 END), 0) AS non_po_received_material_cost
         FROM material_entries m
         LEFT JOIN products p ON p.id = m.product_id
+        LEFT JOIN (
+            SELECT DISTINCT pol.material_entry_id
+            FROM purchase_order_lines pol
+            JOIN purchase_orders po ON po.id = pol.purchase_order_id
+            WHERE po.status NOT IN ('Cancelled', 'Rejected')
+        ) po_link ON po_link.material_entry_id = m.id
         GROUP BY m.job_id
         """,
     )
@@ -642,8 +660,8 @@ def enterprise_job_cost_dataframe(ctx: dict[str, Any]) -> pd.DataFrame:
         "budget_labour_hours", "budget_labour_cost", "budget_materials", "budget_access",
         "budget_subcontractors", "budget_sundries", "target_gp", "estimate_labour_hours",
         "estimate_labour_cost", "estimate_materials", "estimate_access", "estimate_subcontractors",
-        "estimate_sundries", "actual_labour_hours", "actual_labour_cost", "committed_material_cost",
-        "received_material_cost", "po_committed", "po_approved", "supplier_invoiced",
+        "estimate_sundries", "actual_labour_hours", "actual_labour_cost", "non_po_committed_material_cost",
+        "non_po_received_material_cost", "po_committed", "po_approved", "supplier_invoiced",
         "physical_progress", "manual_remaining_hours",
     ]
     for col in numeric:
@@ -672,10 +690,14 @@ def enterprise_job_cost_dataframe(ctx: dict[str, Any]) -> pd.DataFrame:
         result["Budget Labour Cost"] + result["Budget Materials"] + result["Budget Access"]
         + result["Budget Subcontractors"] + result["Budget Sundries"]
     )
-    result["Actual Material Cost"] = result[["received_material_cost", "supplier_invoiced"]].max(axis=1)
+    # Procurement is authoritative for committed/invoiced material cost;
+    # material_entries (already filtered to non-PO rows above) contributes
+    # only the remaining non-PO/manual cost -- reconciled, not duplicated
+    # (architecture decisions #1-#3).
+    result["Actual Material Cost"] = result["supplier_invoiced"] + result["non_po_received_material_cost"]
+    result["Procurement Committed Material Cost"] = result["po_committed"] + result["non_po_committed_material_cost"]
     result["Material Commitment"] = result[[
-        "Budget Materials", "committed_material_cost", "received_material_cost",
-        "po_committed", "po_approved", "supplier_invoiced",
+        "Budget Materials", "Procurement Committed Material Cost",
     ]].max(axis=1)
     result["Cost to Date"] = result["actual_labour_cost"] + result["Actual Material Cost"]
 
