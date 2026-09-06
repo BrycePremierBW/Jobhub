@@ -18,3 +18,6 @@ photos/
 exports/
 deleted_jobs/
 data/
+
+# Local Claude Code dev-server launch config (test credentials, machine-specific paths)
+.claude/
