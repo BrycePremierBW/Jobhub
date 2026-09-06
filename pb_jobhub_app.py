@@ -1836,6 +1836,14 @@ def init_db():
     ensure_column("material_entries", "custom_unit", "TEXT")
     ensure_column("material_entries", "custom_unit_price", "REAL")
     ensure_column("material_entries", "custom_colour", "TEXT")
+    # Snapshots the catalog product's price_ex_gst at the moment this row was
+    # created. Without this, job costing joined live against products and a
+    # later price change on that product silently changed the reported cost
+    # of every job that had ever ordered it, including jobs completed months
+    # earlier (architecture decision #4). NULL on rows created before this
+    # migration -- there is no real historical price to backfill them with,
+    # so they keep falling back to the live product price as before.
+    ensure_column("material_entries", "price_snapshot", "REAL")
     ensure_column("jobs", "restrict_material_products", "INTEGER DEFAULT 0")
     ensure_column("jobs", "allowed_material_suppliers", "TEXT")
     cur.execute("""
@@ -7098,6 +7106,7 @@ def employee_portal():
             request_supplier = ""
             request_unit = ""
             request_colour = ""
+            request_unit_price = None
 
             if material_request_type == "Saved Product":
                 product_search_type = st.radio(
@@ -7121,7 +7130,7 @@ def employee_portal():
                     )
                     employee_product_id = employee_product_name_options[selected_product]
                 selected_product_df = df_query("""
-                    SELECT product_name, supplier, unit
+                    SELECT product_name, supplier, unit, price_ex_gst
                     FROM products
                     WHERE id = ?
                 """, (employee_product_id,))
@@ -7129,6 +7138,7 @@ def employee_portal():
                     request_product_name = str(selected_product_df.iloc[0]["product_name"] or "")
                     request_supplier = str(selected_product_df.iloc[0]["supplier"] or "")
                     request_unit = str(selected_product_df.iloc[0]["unit"] or "")
+                    request_unit_price = float(selected_product_df.iloc[0]["price_ex_gst"] or 0)
                     st.info(f"Selected: {request_product_name} · {request_supplier}")
                 request_colour = st.text_input("Colour / Finish", key=f"employee_saved_product_colour_{selected_job_id}")
             elif material_request_type == "One-off / Not Listed":
@@ -7175,9 +7185,10 @@ def employee_portal():
                                 custom_supplier,
                                 custom_unit,
                                 custom_unit_price,
-                                custom_colour
+                                custom_colour,
+                                price_snapshot
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             selected_job_id,
                             employee_product_id,
@@ -7192,6 +7203,7 @@ def employee_portal():
                             request_unit if material_request_type == "One-off / Not Listed" else "",
                             0 if material_request_type == "One-off / Not Listed" else None,
                             request_colour,
+                            request_unit_price if material_request_type != "One-off / Not Listed" else None,
                         ))
                         if material_override:
                             record_audit_event(
@@ -12964,11 +12976,17 @@ def import_takeoff_job_pack(
                 if not row["name"]:
                     continue
                 cur.execute(
-                    "SELECT id FROM products WHERE LOWER(TRIM(product_code)) = LOWER(TRIM(?)) LIMIT 1",
+                    "SELECT id, price_ex_gst FROM products WHERE LOWER(TRIM(product_code)) = LOWER(TRIM(?)) LIMIT 1",
                     (row["code"],),
                 )
                 product_match = cur.fetchone()
                 product_id = int(product_match[0]) if product_match else None
+                # Snapshot the price this line was actually costed at -- prefer
+                # the takeoff sheet's own unit price (what the estimate used)
+                # and only fall back to the catalog product's current price if
+                # the sheet didn't carry one. Never leave this to a later,
+                # live re-join against products (architecture decision #4).
+                price_snapshot = row["unit_price"] or (float(product_match[1] or 0) if product_match else 0.0)
                 detail_notes = " | ".join(filter(None, [
                     row["notes"],
                     f"Location: {row['location']}" if row["location"] else "",
@@ -12980,8 +12998,8 @@ def import_takeoff_job_pack(
                     INSERT INTO material_entries
                     (job_id, product_id, qty_required, qty_received, date_ordered, supplier, notes,
                      custom_product_code, custom_product_name, custom_supplier, custom_unit,
-                     custom_unit_price, custom_colour)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     custom_unit_price, custom_colour, price_snapshot)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     job_id,
                     product_id,
@@ -12996,6 +13014,7 @@ def import_takeoff_job_pack(
                     "" if product_id else row["unit"],
                     None if product_id else row["unit_price"],
                     row["colour"],
+                    price_snapshot,
                 ))
                 material_count += 1
 
@@ -13348,11 +13367,17 @@ def attach_intake_package_to_job(
                     merged_material_count += 1
                     continue
                 cur.execute(
-                    "SELECT id FROM products WHERE LOWER(TRIM(product_code)) = LOWER(TRIM(?)) LIMIT 1",
+                    "SELECT id, price_ex_gst FROM products WHERE LOWER(TRIM(product_code)) = LOWER(TRIM(?)) LIMIT 1",
                     (row["code"],),
                 )
                 product_match = cur.fetchone()
                 product_id = int(product_match[0]) if product_match else None
+                # Snapshot the price this line was actually costed at -- prefer
+                # the intake sheet's own unit price (what the estimate used)
+                # and only fall back to the catalog product's current price if
+                # the sheet didn't carry one. Never leave this to a later,
+                # live re-join against products (architecture decision #4).
+                price_snapshot = row["unit_price"] or (float(product_match[1] or 0) if product_match else 0.0)
                 detail_notes = " | ".join(filter(None, [
                     row["notes"],
                     f"Location: {row['location']}" if row["location"] else "",
@@ -13364,8 +13389,8 @@ def attach_intake_package_to_job(
                     INSERT INTO material_entries
                     (job_id, product_id, qty_required, qty_received, date_ordered, supplier, notes,
                      custom_product_code, custom_product_name, custom_supplier, custom_unit,
-                     custom_unit_price, custom_colour)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     custom_unit_price, custom_colour, price_snapshot)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     job_id,
                     product_id,
@@ -13380,6 +13405,7 @@ def attach_intake_package_to_job(
                     "" if product_id else row["unit"],
                     None if product_id else row["unit_price"],
                     row["colour"],
+                    price_snapshot,
                 ))
                 material_count += 1
 
@@ -16611,8 +16637,8 @@ def job_cost_summary_dataframe():
 
     materials = df_query("""
         SELECT m.job_id,
-               COALESCE(SUM(COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, p.price_ex_gst, 0)), 0) AS 'Committed Material Cost',
-               COALESCE(SUM(COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, p.price_ex_gst, 0)), 0) AS 'Actual Material Cost',
+               COALESCE(SUM(COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS 'Committed Material Cost',
+               COALESCE(SUM(COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS 'Actual Material Cost',
                COALESCE(SUM(COALESCE(m.qty_required, 0)), 0) AS 'Material Qty Required',
                COALESCE(SUM(COALESCE(m.qty_received, 0)), 0) AS 'Material Qty Received',
                COUNT(*) AS 'Material Lines'
@@ -16945,8 +16971,8 @@ def jobhub_ai_context(selected_job_id=None):
                        COALESCE(NULLIF(m.custom_product_name, ''), p.product_name, '') AS 'Product Name',
                        m.qty_required AS 'Qty Required',
                        m.qty_received AS 'Qty Received',
-                       COALESCE(m.custom_unit_price, p.price_ex_gst, 0) AS 'Unit Price',
-                       ROUND(CAST((COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, p.price_ex_gst, 0)) AS numeric), 2) AS 'Line Cost',
+                       COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0) AS 'Unit Price',
+                       ROUND(CAST((COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)) AS numeric), 2) AS 'Line Cost',
                        m.notes AS 'Notes'
                 FROM material_entries m
                 LEFT JOIN products p ON p.id = m.product_id
@@ -18464,8 +18490,8 @@ def pb_job_cost_frame():
 
     materials = df_query("""
         SELECT m.job_id,
-               COALESCE(SUM(COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, p.price_ex_gst, 0)), 0) AS 'Committed Material Cost',
-               COALESCE(SUM(COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, p.price_ex_gst, 0)), 0) AS 'Material Cost',
+               COALESCE(SUM(COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS 'Committed Material Cost',
+               COALESCE(SUM(COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS 'Material Cost',
                COALESCE(SUM(COALESCE(m.qty_required, 0)), 0) AS 'Material Qty Required',
                COALESCE(SUM(COALESCE(m.qty_received, 0)), 0) AS 'Material Qty Received',
                COUNT(*) AS 'Material Lines'
@@ -22404,11 +22430,11 @@ def render_job_linked_info(job_id, expanded=True):
                COALESCE(NULLIF(m.custom_product_name, ''), p.product_name, '') AS "Product Name",
                COALESCE(NULLIF(m.supplier, ''), NULLIF(m.custom_supplier, ''), p.supplier, '') AS "Supplier",
                COALESCE(NULLIF(m.custom_unit, ''), p.unit, '') AS "Unit",
-               COALESCE(m.custom_unit_price, p.price_ex_gst, 0) AS "Unit Price Ex GST",
+               COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0) AS "Unit Price Ex GST",
                COALESCE(NULLIF(m.custom_colour, ''), '') AS "Colour / Finish",
                m.qty_required AS "Qty Required",
                m.qty_received AS "Qty Received",
-               ROUND(CAST((COALESCE(m.custom_unit_price, p.price_ex_gst, 0) * COALESCE(m.qty_required, 0)) AS numeric), 2) AS "Total Cost Ex GST",
+               ROUND(CAST((COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0) * COALESCE(m.qty_required, 0)) AS numeric), 2) AS "Total Cost Ex GST",
                m.date_ordered AS "Date Ordered",
                m.supplier AS "Supplier Override",
                m.notes AS "Notes"
@@ -25297,9 +25323,10 @@ elif menu == "Material Costs":
                                 custom_supplier,
                                 custom_unit,
                                 custom_unit_price,
-                                custom_colour
+                                custom_colour,
+                                price_snapshot
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             selected_material_job_id,
                             product_id,
@@ -25314,6 +25341,7 @@ elif menu == "Material Costs":
                             custom_unit,
                             custom_unit_price,
                             custom_colour,
+                            matched_price if entry_type != "One-off / Not Listed" else None,
                         ))
 
                         if material_admin_override:
@@ -25351,11 +25379,11 @@ elif menu == "Material Costs":
                COALESCE(NULLIF(m.custom_product_name, ''), p.product_name, '') AS 'Product Name',
                COALESCE(NULLIF(m.supplier, ''), NULLIF(m.custom_supplier, ''), p.supplier, '') AS 'Supplier',
                COALESCE(NULLIF(m.custom_unit, ''), p.unit, '') AS 'Unit',
-               COALESCE(m.custom_unit_price, p.price_ex_gst, 0) AS 'Unit Price',
+               COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0) AS 'Unit Price',
                COALESCE(NULLIF(m.custom_colour, ''), '') AS 'Colour / Finish',
                m.qty_required AS 'Qty Required',
                m.qty_received AS 'Qty Received',
-               ROUND(CAST((COALESCE(m.custom_unit_price, p.price_ex_gst, 0) * COALESCE(m.qty_required, 0)) AS numeric), 2) AS 'Total Cost',
+               ROUND(CAST((COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0) * COALESCE(m.qty_required, 0)) AS numeric), 2) AS 'Total Cost',
                m.date_ordered AS 'Date Ordered',
                m.notes AS 'Notes'
         FROM material_entries m
@@ -26066,11 +26094,11 @@ elif menu == "Reports / Export":
                        COALESCE(NULLIF(m.custom_product_name, ''), p.product_name, '') AS 'Product Name',
                        COALESCE(NULLIF(m.supplier, ''), NULLIF(m.custom_supplier, ''), p.supplier, '') AS 'Supplier',
                        COALESCE(NULLIF(m.custom_unit, ''), p.unit, '') AS 'Unit',
-                       COALESCE(m.custom_unit_price, p.price_ex_gst, 0) AS 'Unit Price Ex GST',
+                       COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0) AS 'Unit Price Ex GST',
                        COALESCE(NULLIF(m.custom_colour, ''), '') AS 'Colour / Finish',
                        m.qty_required AS 'Qty Required',
                        m.qty_received AS 'Qty Received',
-                       ROUND(CAST((COALESCE(m.custom_unit_price, p.price_ex_gst, 0) * COALESCE(m.qty_required, 0)) AS numeric), 2) AS 'Total Cost Ex GST',
+                       ROUND(CAST((COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0) * COALESCE(m.qty_required, 0)) AS numeric), 2) AS 'Total Cost Ex GST',
                        m.date_ordered AS 'Date Ordered',
                        m.supplier AS 'Supplier Override',
                        m.notes AS 'Notes'
@@ -26551,11 +26579,11 @@ elif menu == "Reports / Export":
                        COALESCE(NULLIF(m.custom_product_name, ''), p.product_name, '') AS product_name,
                        COALESCE(NULLIF(m.supplier, ''), NULLIF(m.custom_supplier, ''), p.supplier, '') AS supplier,
                        COALESCE(NULLIF(m.custom_unit, ''), p.unit, '') AS unit,
-                       COALESCE(m.custom_unit_price, p.price_ex_gst, 0) AS price_ex_gst,
+                       COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0) AS price_ex_gst,
                        COALESCE(NULLIF(m.custom_colour, ''), '') AS colour_finish,
                        m.qty_required,
                        m.qty_received,
-                       ROUND(CAST((COALESCE(m.custom_unit_price, p.price_ex_gst, 0) * COALESCE(m.qty_required, 0)) AS numeric), 2) AS total_cost,
+                       ROUND(CAST((COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0) * COALESCE(m.qty_required, 0)) AS numeric), 2) AS total_cost,
                        m.date_ordered,
                        m.notes
                 FROM material_entries m

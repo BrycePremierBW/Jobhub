@@ -86,8 +86,8 @@ separate PlanReader 3D tool.
 | 8 | Server-side role revalidation before privileged mutations | [#117](https://github.com/BrycePremierBW/Jobhub/pull/117) | Merged, verified |
 | 6 | Scheduling TOCTOU double-booking fix | [#118](https://github.com/BrycePremierBW/Jobhub/pull/118) | Merged, verified |
 | 7 | Bulk crew scheduling — transactional/deterministic partial reporting | [#119](https://github.com/BrycePremierBW/Jobhub/pull/119) | Merged, verified |
-| 5 | Configurable tax rate with document-level snapshots | [#120](https://github.com/BrycePremierBW/Jobhub/pull/120) | In review |
-| 4 | Price snapshots on material entries | _pending_ | Not started |
+| 5 | Configurable tax rate with document-level snapshots | [#120](https://github.com/BrycePremierBW/Jobhub/pull/120) | Merged, verified |
+| 4 | Price snapshots on material entries | [#121](https://github.com/BrycePremierBW/Jobhub/pull/121) | In review |
 | 1/2/3 | Procurement-authoritative Job Costs reconciliation | _pending_ | Not started |
 | 10 | Dead `jobhub/pages` code: inventory → port → test → remove | _pending_ | Not started |
 | 9 | Multi-tenant org-scoping design document | _pending_ | Not started |
@@ -254,4 +254,55 @@ rate, including a missing-rate fallback to 10%. Full suite: 571 tests
 green (rebased cleanly onto #119). Ruff (`F821`/`F823`) clean. Smoke test
 renders all 33 routes.
 
-**PR.** [#120](https://github.com/BrycePremierBW/Jobhub/pull/120)
+**PR.** [#120](https://github.com/BrycePremierBW/Jobhub/pull/120) — merged,
+post-merge CI verified green.
+
+### 2026-09-06 — Decision #4: price snapshots on material entries
+
+**Reproduce.** Every job-cost query (`enterprise_job_cost_dataframe()`, the
+Materials tab, Job Costing views, the Control Centre summary — 17 call
+sites across `pb_jobhub_app.py` and `jobhub_enterprise.py`) computed
+material cost as `qty * COALESCE(m.custom_unit_price, p.price_ex_gst, 0)`:
+a LEFT JOIN against the *live* `products` table, with no price ever
+recorded on the `material_entries` row itself for a real catalog product.
+Wrote `tests/test_material_price_snapshot.py`; the pre-fix run showed the
+exact defect directly — a material line costed at $500 (10 units × a $50
+catalog price) silently became $200 once the catalog price was edited to
+$20 *after* the job had already ordered it (`500.0 != 200.0`), with three
+more tests erroring outright since the `price_snapshot` column and its
+population logic in the Job Pack/Smart Intake import code didn't exist
+yet.
+
+**Fix.** Added `price_snapshot REAL` to `material_entries` (`ensure_column`,
+same additive pattern as `custom_unit_price`). Populated it at all four
+insert sites: the employee material-request form now looks up and stores
+the selected product's current price at request time (previously not
+captured anywhere for that flow); the Job Pack and Smart Intake import
+paths now snapshot the takeoff/intake sheet's own parsed unit price
+(previously silently discarded whenever the line matched a catalog
+product) and only fall back to a live product-price lookup if the sheet
+didn't carry one; the admin "Save Material Entry" form now persists
+`matched_price` (already computed and shown to the user, but never
+actually stored). All 17 cost-aggregation COALESCE call sites now read
+`COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)` --
+an explicit manual override still wins, then the new snapshot, then the
+live price as a last-resort fallback for rows created before this
+migration (there is no real historical price to backfill them with, so
+old rows keep their pre-existing behavior rather than getting a guessed
+value). Confirmed 4 more occurrences of the same COALESCE pattern exist
+only in the dead `jobhub/pages`-sibling modules (`ai_tools.py`,
+`control_centre.py`, `estimating.py`, `job_views.py`) already flagged for
+decision #10 -- left untouched since nothing imports them.
+
+**Tests.** `tests/test_material_price_snapshot.py` -- a snapshotted row's
+reported cost is unaffected by a later catalog price change; a
+pre-migration row (`price_snapshot IS NULL`) still falls back to the live
+price as before; `custom_unit_price` still takes priority over the
+snapshot; the real import price-snapshot computation prefers the sheet's
+own price, falls back to the live product price only when the sheet has
+none, and returns 0 when neither exists. Full suite: 577 tests green.
+Ruff clean. Smoke test renders all 33 routes.
+`tests/material_order_workflow_test.py` (submit/approve/convert/PDF)
+still passes end-to-end.
+
+**PR.** [#121](https://github.com/BrycePremierBW/Jobhub/pull/121)
