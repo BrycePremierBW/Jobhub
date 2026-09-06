@@ -87,8 +87,8 @@ separate PlanReader 3D tool.
 | 6 | Scheduling TOCTOU double-booking fix | [#118](https://github.com/BrycePremierBW/Jobhub/pull/118) | Merged, verified |
 | 7 | Bulk crew scheduling — transactional/deterministic partial reporting | [#119](https://github.com/BrycePremierBW/Jobhub/pull/119) | Merged, verified |
 | 5 | Configurable tax rate with document-level snapshots | [#120](https://github.com/BrycePremierBW/Jobhub/pull/120) | Merged, verified |
-| 4 | Price snapshots on material entries | [#121](https://github.com/BrycePremierBW/Jobhub/pull/121) | In review |
-| 1/2/3 | Procurement-authoritative Job Costs reconciliation | _pending_ | Not started |
+| 4 | Price snapshots on material entries | [#121](https://github.com/BrycePremierBW/Jobhub/pull/121) | Merged, verified |
+| 1/2/3 | Procurement-authoritative Job Costs reconciliation | [#122](https://github.com/BrycePremierBW/Jobhub/pull/122) | In review |
 | 10 | Dead `jobhub/pages` code: inventory → port → test → remove | _pending_ | Not started |
 | 9 | Multi-tenant org-scoping design document | _pending_ | Not started |
 | 11 | Palm Lakes migration | **BLOCKED — do not touch** | N/A |
@@ -305,4 +305,75 @@ Ruff clean. Smoke test renders all 33 routes.
 `tests/material_order_workflow_test.py` (submit/approve/convert/PDF)
 still passes end-to-end.
 
-**PR.** [#121](https://github.com/BrycePremierBW/Jobhub/pull/121)
+**PR.** [#121](https://github.com/BrycePremierBW/Jobhub/pull/121) — merged,
+post-merge CI verified green.
+
+### 2026-09-06 — Decisions #1/#2/#3: Procurement-authoritative Job Costs reconciliation
+
+**Reproduce.** Audited every material-cost query and found **three
+independent job-cost implementations** in this codebase:
+`job_cost_summary_dataframe()` (the actual "Job Costs / Forecasting" page,
+`pb_jobhub_app.py`), `pb_job_cost_frame()` (the Control Centre summary,
+same file), and `enterprise_job_cost_dataframe()` (the newer "Live Job
+Control & Forecast-to-Complete" page, `jobhub_enterprise.py`). The first
+two computed "Committed Material Cost" / "Actual Material Cost" **purely**
+from `material_entries`, with zero reference to `purchase_orders` or
+`supplier_invoices` -- Procurement wasn't consulted at all. Wrote
+`tests/test_procurement_authoritative_job_costs.py`; all 5 tests fail
+against pre-fix code, most tellingly: a PO raised for $500 with no
+material_entries row behind it (materials ordered directly rather than via
+a logged request) contributed **$0** to Job Costs -- invisible, not just
+inaccurate. `enterprise_job_cost_dataframe()` was less wrong -- it already
+blends `material_entries` and `po_committed`/`po_approved`/
+`supplier_invoiced` via `max()` -- but `max()` still means whichever
+source is bigger silently wins rather than Procurement genuinely being
+authoritative and material_entries being additive-only for the non-PO
+remainder, so it doesn't yet satisfy decision #2's "reconcile, don't
+duplicate."
+
+**Fix.** In both `job_cost_summary_dataframe()` and `pb_job_cost_frame()`:
+excluded any `material_entries` row already linked to an active PO line
+(`purchase_order_lines.material_entry_id`, status not `Cancelled`/
+`Rejected`) from the material_entries $ aggregation -- the same
+`NOT EXISTS`/PO-link convention `_material_request_lines()` in
+`jobhub_enterprise.py` already established for finding not-yet-ordered
+material requests. Added `purchase_orders`/`supplier_invoices`
+aggregations and made the final cost additive and reconciled rather than
+material_entries-only:
+`Committed Material Cost = PO subtotal (active POs) + non-PO material_entries cost`,
+`Actual Material Cost = Supplier invoiced total + non-PO material_entries received cost`.
+A material_entries row's own qty*price no longer counts once it's on a PO
+-- the PO's own (possibly adjusted at ordering time) subtotal is used
+instead, and the eventual supplier invoice becomes the authoritative
+"actual" figure once one exists. Deliberately left
+`enterprise_job_cost_dataframe()`'s `max()`-based blend untouched --
+reshaping it to the same additive formula is a different, larger change
+to a differently-structured function, and bundling it here would turn a
+minimal, focused fix into a wider rewrite across three call sites at
+once; noted below as an explicit follow-up.
+
+**Tests.** `tests/test_procurement_authoritative_job_costs.py` -- a non-PO
+material line still contributes its own cost; a PO-linked line is
+excluded from material_entries and the PO's own subtotal is used instead;
+a PO with no material_entries row is no longer invisible; a supplier
+invoice becomes the actual cost for a PO-linked line; two lines (one PO'd,
+one not) sum with no double-count. Full suite: 582 tests green. Ruff
+clean. Smoke test renders all 33 routes.
+`tests/material_order_workflow_test.py` and `tests/run_stage_control_ci.py`
+(both exercise material/PO/job-cost flows end-to-end) still pass.
+
+**Known remaining gap (explicit follow-up, not yet actioned).**
+`enterprise_job_cost_dataframe()` in `jobhub_enterprise.py` (the "Live Job
+Control & Forecast-to-Complete" page) still uses the pre-existing
+`max(material_entries totals, po_committed, po_approved, supplier_invoiced)`
+blend rather than the same additive PO-link-exclusion reconciliation
+applied here. It is not currently reporting an under-count (max() never
+under-reports), but it does not yet treat Procurement as strictly
+authoritative per decision #1's letter. Revisiting it is natural to pair
+with decision #10's dead-code/duplication inventory, since JobHub
+currently maintains three separate job-cost calculation implementations
+across two files -- consolidating them, not just reconciling each
+independently, is the more durable fix and deserves its own scoped
+workstream rather than being folded into this one.
+
+**PR.** [#122](https://github.com/BrycePremierBW/Jobhub/pull/122)
