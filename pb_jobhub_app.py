@@ -16635,16 +16635,47 @@ def job_cost_summary_dataframe():
     if jobs.empty:
         return jobs
 
+    # Committed/Actual material $ must come from Procurement (purchase_orders /
+    # supplier_invoices) once a material_entries row has been converted onto an
+    # active PO -- material_entries is only the authoritative $ source for
+    # lines that were never put on a PO (a genuine non-PO/manual cost).
+    # Without the po_link exclusion below, a converted line's cost would be
+    # counted twice: once here from material_entries and once from the PO's
+    # own subtotal (architecture decisions #1-#3).
     materials = df_query("""
         SELECT m.job_id,
-               COALESCE(SUM(COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS 'Committed Material Cost',
-               COALESCE(SUM(COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS 'Actual Material Cost',
+               COALESCE(SUM(CASE WHEN po_link.material_entry_id IS NULL
+                   THEN COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)
+                   ELSE 0 END), 0) AS 'Non-PO Committed Material Cost',
+               COALESCE(SUM(CASE WHEN po_link.material_entry_id IS NULL
+                   THEN COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)
+                   ELSE 0 END), 0) AS 'Non-PO Actual Material Cost',
                COALESCE(SUM(COALESCE(m.qty_required, 0)), 0) AS 'Material Qty Required',
                COALESCE(SUM(COALESCE(m.qty_received, 0)), 0) AS 'Material Qty Received',
                COUNT(*) AS 'Material Lines'
         FROM material_entries m
         LEFT JOIN products p ON p.id = m.product_id
+        LEFT JOIN (
+            SELECT DISTINCT pol.material_entry_id
+            FROM purchase_order_lines pol
+            JOIN purchase_orders po ON po.id = pol.purchase_order_id
+            WHERE po.status NOT IN ('Cancelled', 'Rejected')
+        ) po_link ON po_link.material_entry_id = m.id
         GROUP BY m.job_id
+    """)
+
+    procurement = df_query("""
+        SELECT job_id,
+               COALESCE(SUM(CASE WHEN status NOT IN ('Cancelled', 'Rejected') THEN subtotal_ex_gst ELSE 0 END), 0) AS 'PO Committed Material Cost'
+        FROM purchase_orders
+        GROUP BY job_id
+    """)
+
+    supplier_invoices = df_query("""
+        SELECT job_id,
+               COALESCE(SUM(CASE WHEN status NOT IN ('Rejected', 'Cancelled') THEN subtotal_ex_gst ELSE 0 END), 0) AS 'Supplier Invoiced Material Cost'
+        FROM supplier_invoices
+        GROUP BY job_id
     """)
 
     wages = df_query("""
@@ -16691,12 +16722,14 @@ def job_cost_summary_dataframe():
     """)
 
     df = jobs.copy()
-    for extra in [materials, wages, timesheets, estimates]:
+    for extra in [materials, procurement, supplier_invoices, wages, timesheets, estimates]:
         if extra is not None and not extra.empty:
             df = df.merge(extra, on="job_id", how="left")
 
     number_cols = [
-        "Contract Value", "Committed Material Cost", "Actual Material Cost", "Material Qty Required", "Material Qty Received",
+        "Contract Value", "Non-PO Committed Material Cost", "Non-PO Actual Material Cost",
+        "PO Committed Material Cost", "Supplier Invoiced Material Cost",
+        "Material Qty Required", "Material Qty Received",
         "Material Lines", "Wage Hours", "Actual Labour Cost", "Wage Lines", "Timesheet Hours",
         "Timesheet Lines", "Estimated Labour Hours", "Labour Rate ($ / Painter Day)", "Estimated Materials",
         "Estimated Access / Equipment", "Estimated Subcontractor", "Estimated Sundries",
@@ -16713,6 +16746,13 @@ def job_cost_summary_dataframe():
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("")
+
+    # Procurement is the authoritative source for committed/invoiced material
+    # cost once a line has a PO; material_entries contributes only the
+    # remaining non-PO/manual cost so the two sources are reconciled, not
+    # independently duplicated (architecture decisions #1-#3).
+    df["Committed Material Cost"] = df["PO Committed Material Cost"] + df["Non-PO Committed Material Cost"]
+    df["Actual Material Cost"] = df["Supplier Invoiced Material Cost"] + df["Non-PO Actual Material Cost"]
 
     df["Actual Labour Hours"] = df["Wage Hours"]
     df["Total Actual Cost"] = df["Actual Material Cost"] + df["Actual Labour Cost"]
@@ -18488,16 +18528,44 @@ def pb_job_cost_frame():
     if jobs.empty:
         return jobs
 
+    # See job_cost_summary_dataframe() for why PO-linked material_entries rows
+    # are excluded here: Procurement is the authoritative $ source for a line
+    # once it's on an active PO, so material_entries only contributes the
+    # remaining non-PO/manual cost (architecture decisions #1-#3).
     materials = df_query("""
         SELECT m.job_id,
-               COALESCE(SUM(COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS 'Committed Material Cost',
-               COALESCE(SUM(COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS 'Material Cost',
+               COALESCE(SUM(CASE WHEN po_link.material_entry_id IS NULL
+                   THEN COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)
+                   ELSE 0 END), 0) AS 'Non-PO Committed Material Cost',
+               COALESCE(SUM(CASE WHEN po_link.material_entry_id IS NULL
+                   THEN COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)
+                   ELSE 0 END), 0) AS 'Non-PO Material Cost',
                COALESCE(SUM(COALESCE(m.qty_required, 0)), 0) AS 'Material Qty Required',
                COALESCE(SUM(COALESCE(m.qty_received, 0)), 0) AS 'Material Qty Received',
                COUNT(*) AS 'Material Lines'
         FROM material_entries m
         LEFT JOIN products p ON p.id = m.product_id
+        LEFT JOIN (
+            SELECT DISTINCT pol.material_entry_id
+            FROM purchase_order_lines pol
+            JOIN purchase_orders po ON po.id = pol.purchase_order_id
+            WHERE po.status NOT IN ('Cancelled', 'Rejected')
+        ) po_link ON po_link.material_entry_id = m.id
         GROUP BY m.job_id
+    """)
+
+    procurement = df_query("""
+        SELECT job_id,
+               COALESCE(SUM(CASE WHEN status NOT IN ('Cancelled', 'Rejected') THEN subtotal_ex_gst ELSE 0 END), 0) AS 'PO Committed Material Cost'
+        FROM purchase_orders
+        GROUP BY job_id
+    """)
+
+    supplier_invoices = df_query("""
+        SELECT job_id,
+               COALESCE(SUM(CASE WHEN status NOT IN ('Rejected', 'Cancelled') THEN subtotal_ex_gst ELSE 0 END), 0) AS 'Supplier Invoiced Material Cost'
+        FROM supplier_invoices
+        GROUP BY job_id
     """)
 
     wages = df_query("""
@@ -18558,12 +18626,14 @@ def pb_job_cost_frame():
     """)
 
     df = jobs.copy()
-    for extra in [materials, wages, timesheets, budgets, variations, claims]:
+    for extra in [materials, procurement, supplier_invoices, wages, timesheets, budgets, variations, claims]:
         if extra is not None and not extra.empty:
             df = df.merge(extra, on="job_id", how="left")
 
     numeric_cols = [
-        "Contract Value", "Committed Material Cost", "Material Cost", "Material Qty Required", "Material Qty Received", "Material Lines",
+        "Contract Value", "Non-PO Committed Material Cost", "Non-PO Material Cost",
+        "PO Committed Material Cost", "Supplier Invoiced Material Cost",
+        "Material Qty Required", "Material Qty Received", "Material Lines",
         "Wage Hours", "Labour Cost", "Timesheet Hours", "Timesheet Lines", "Budget Labour Hours",
         "Budget Labour Cost", "Budget Materials", "Budget Access", "Budget Subcontractors", "Budget Sundries",
         "Variation Value", "Approved Variation Value", "Variation Count", "Claimed Amount",
@@ -18578,6 +18648,12 @@ def pb_job_cost_frame():
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("")
+
+    # Procurement is the authoritative source for committed/invoiced material
+    # cost once a line has a PO; material_entries contributes only the
+    # remaining non-PO/manual cost (architecture decisions #1-#3).
+    df["Committed Material Cost"] = df["PO Committed Material Cost"] + df["Non-PO Committed Material Cost"]
+    df["Material Cost"] = df["Supplier Invoiced Material Cost"] + df["Non-PO Material Cost"]
 
     df["Adjusted Contract Value"] = df["Contract Value"] + df["Approved Variation Value"]
     df["Total Budget Cost"] = df["Budget Labour Cost"] + df["Budget Materials"] + df["Budget Access"] + df["Budget Subcontractors"] + df["Budget Sundries"]
