@@ -73,7 +73,10 @@ _TRACKED_TAB_SETS = (
         "Photos",
         "Notes",
     }),
-    frozenset({"Add", "Edit", "Remove", "Merge", "List"}),
+    # Builders & Clients no longer uses a tabs widget -- converted to a
+    # lazy st.radio(key="builders_clients_section") selector alongside
+    # Job Register (jobhub-audit-2026-09, JH-PERF-JOBS-001 follow-up),
+    # which persists its own selection across reruns natively.
     frozenset({"Add", "Edit", "Remove / Deactivate", "List"}),
     frozenset({"Edit selected line", "Delete selected line"}),
     frozenset({
