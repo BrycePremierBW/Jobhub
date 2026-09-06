@@ -3083,6 +3083,30 @@ def apply_schema_migrations():
                 (file_data_migration_id, now),
             )
 
+        # Phase 2 of docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md
+        # (architecture decision #9): identity scoping. Every existing
+        # account is backfilled onto the single default organisation --
+        # this is purely additive and changes no query behaviour yet (no
+        # business-data table is scoped by it in this phase), it only
+        # establishes "who belongs to which org" for later phases to build
+        # on. ensure_organization_schema() has already run by this point
+        # (see initialise_jobhub_runtime()), so the default org row exists.
+        org_migration_id = "20260906_app_users_organization_id_v1"
+        if org_migration_id not in applied:
+            _migration_ensure_column(cur, "app_users", "organization_id", "INTEGER")
+            from jobhub.organization_schema_guard import get_organization_id, DEFAULT_ORGANIZATION_SLUG
+            default_org_id = get_organization_id(DEFAULT_ORGANIZATION_SLUG)
+            if default_org_id is not None:
+                cur.execute(
+                    "UPDATE app_users SET organization_id = ? WHERE organization_id IS NULL",
+                    (default_org_id,),
+                )
+            now = jobhub_now().strftime("%Y-%m-%d %H:%M:%S")
+            cur.execute(
+                "INSERT INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+                (org_migration_id, now),
+            )
+
         conn.commit()
         return True
     except Exception:
@@ -6416,11 +6440,20 @@ def seed_app_users():
         )
 
         if user_count == 0 and bootstrap_password and not bootstrap_errors:
+            # The app_users.organization_id backfill migration (see
+            # apply_schema_migrations()) only ever runs once and only
+            # touches rows that already exist at that point -- on a fresh
+            # database this bootstrap admin is created afterward, so it
+            # must set its own organization_id here rather than relying on
+            # that one-time backfill (architecture decision #9, Phase 2).
+            from jobhub.organization_schema_guard import get_organization_id, DEFAULT_ORGANIZATION_SLUG
+            bootstrap_org_id = get_organization_id(DEFAULT_ORGANIZATION_SLUG)
             cur.execute("""
                 INSERT INTO app_users
                 (username, password_hash, role, employee_id, active, notes,
-                 failed_login_count, locked_until, must_change_password, password_changed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 failed_login_count, locked_until, must_change_password, password_changed_at,
+                 organization_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 bootstrap_username,
                 hash_password(bootstrap_password),
@@ -6432,6 +6465,7 @@ def seed_app_users():
                 "",
                 1,
                 jobhub_now().strftime("%Y-%m-%d %H:%M:%S"),
+                bootstrap_org_id,
             ))
         elif bootstrap_password and not bootstrap_errors:
             # A secure environment value can recover an existing admin account
@@ -6661,8 +6695,8 @@ def _revalidate_session_user(user: dict) -> dict | None:
         return None
     try:
         live_df = df_query(
-            "SELECT role, active, COALESCE(must_change_password, 0) AS must_change_password "
-            "FROM app_users WHERE id = ?",
+            "SELECT role, active, COALESCE(must_change_password, 0) AS must_change_password, "
+            "organization_id FROM app_users WHERE id = ?",
             (user_id,),
         )
     except Exception:
@@ -6675,6 +6709,11 @@ def _revalidate_session_user(user: dict) -> dict | None:
     live = live_df.iloc[0]
     user["role"] = str(live["role"])
     user["must_change_password"] = bool(int(live["must_change_password"] or 0))
+    # Multi-tenant organisation scoping, Phase 2 (architecture decision #9,
+    # docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md). Not yet consumed by
+    # any business-data query -- this only keeps session state in sync with
+    # the authoritative app_users row, the same way role/active already are.
+    user["organization_id"] = int(live["organization_id"]) if not pd.isna(live["organization_id"]) else None
     return user
 
 
@@ -6725,6 +6764,7 @@ def require_login():
                        COALESCE(u.failed_login_count, 0) AS failed_login_count,
                        COALESCE(u.locked_until, '') AS locked_until,
                        COALESCE(u.must_change_password, 0) AS must_change_password,
+                       u.organization_id,
                        e.name AS employee_name
                 FROM app_users u
                 LEFT JOIN employees e ON e.id = u.employee_id
@@ -6789,6 +6829,7 @@ def require_login():
                         "employee_id": int(row["employee_id"]) if not pd.isna(row["employee_id"]) else None,
                         "employee_name": "" if pd.isna(row["employee_name"]) else str(row["employee_name"]),
                         "must_change_password": bool(int(row["must_change_password"] or 0)),
+                        "organization_id": int(row["organization_id"]) if not pd.isna(row["organization_id"]) else None,
                     }
                     st.session_state["user"] = user_dict
                     st.session_state["_pb_auth_token"] = auth_token
@@ -7748,11 +7789,20 @@ def user_access_page():
                             elif not employee_match.empty:
                                 pb_error("That employee is already linked to another login.")
                             else:
+                                # New users belong to the creating admin's own
+                                # organisation (architecture decision #9,
+                                # Phase 2) -- falls back to the default org for
+                                # a pre-Phase-2 session that hasn't picked one
+                                # up yet.
+                                creator_org_id = (get_current_user() or {}).get("organization_id")
+                                if creator_org_id is None:
+                                    from jobhub.organization_schema_guard import get_organization_id, DEFAULT_ORGANIZATION_SLUG
+                                    creator_org_id = get_organization_id(DEFAULT_ORGANIZATION_SLUG)
                                 execute("""
                                     INSERT INTO app_users
                                     (username, password_hash, role, employee_id, active, notes,
-                                     must_change_password, password_changed_at)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                     must_change_password, password_changed_at, organization_id)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """, (
                                     username.strip(),
                                     hash_password(password),
@@ -7762,6 +7812,7 @@ def user_access_page():
                                     notes,
                                     1,
                                     jobhub_now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    creator_org_id,
                                 ))
                                 record_audit_event(
                                     "user_created",
@@ -23305,15 +23356,19 @@ def initialise_jobhub_runtime(database_url, data_dir):
     each deployment or server restart.
     """
     init_db()
-    apply_schema_migrations()
-    backfill_job_document_file_data()
     # Tenant-metadata foundation for eventual multi-tenant organisation
     # scoping (architecture decision #9). Previously this only ran lazily
     # the first time someone opened Xero setup, so the organizations table
     # and its default "premier-brushworks" row were not guaranteed to exist
     # otherwise. Phase 1 of docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md.
+    # Runs right after init_db() (which creates app_settings, needed by
+    # ensure_organization_schema()'s own version marker) and before
+    # apply_schema_migrations(), because Phase 2's app_users.organization_id
+    # backfill migration looks up the default organisation's real id here.
     from jobhub.organization_schema_guard import ensure_organization_schema
     ensure_organization_schema()
+    apply_schema_migrations()
+    backfill_job_document_file_data()
     ensure_enterprise_schema(connect)
     ensure_v2_schema(connect)
     ensure_v4_schema(connect)
