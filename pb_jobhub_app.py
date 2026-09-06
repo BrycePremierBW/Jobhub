@@ -14502,11 +14502,32 @@ def smart_intake_import_page():
         action_label = "Attach Take-off to Job"
         action_help = "Creates a new estimate on the existing job and attaches the materials and documents."
 
+    # Importing is not idempotent (a new job always gets a fresh job number
+    # when the intake pack doesn't state one), and this page shows no
+    # confirmation banner that removes the button, so a slow import can be
+    # re-triggered by an impatient double-click or a re-click after success,
+    # creating a second duplicate job/estimate from the same upload. Guard
+    # against that with a signature of this exact upload + target-job choice.
+    intake_signature = (
+        tuple(sorted((f.name, uploaded_file_size(f)) for f in uploaded_documents)),
+        create_new_job,
+        selected_job_id,
+        intake_job_name if create_new_job else None,
+    )
+    already_imported = st.session_state.setdefault("smart_intake_imported_signatures", set())
+    if intake_signature in already_imported:
+        st.info(
+            "This upload was already imported in this session. Choose "
+            "different documents, or change the job selection above, to "
+            "import again."
+        )
+
     if st.button(
         action_label,
         type="primary",
         key="smart_intake_confirm",
         help=action_help,
+        disabled=intake_signature in already_imported,
     ):
         work_parsed = dict(parsed)
         if not include_lines:
@@ -14571,6 +14592,7 @@ def smart_intake_import_page():
                 f"${result['material_allowance']:,.2f} material allowance."
             )
             st.caption(f"Saved intake folder: {result['pack_folder']}")
+            already_imported.add(intake_signature)
         except Exception as exc:
             pb_error(f"The intake was not imported: {exc}")
 
@@ -18811,13 +18833,22 @@ def pb_control_variations():
             notes = st.text_area("Notes")
             submitted = st.form_submit_button("Save Variation")
         if submitted:
-            execute("""
-                INSERT INTO job_variations
-                (job_id, variation_no, description, reason, amount_ex_gst, status, sent_date, approved_date, approved_by, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (job_id, variation_no, description, reason, amount, status, sent_date, approved_date, approved_by, notes, jobhub_now().strftime("%Y-%m-%d %H:%M:%S")))
-            pb_success("Variation saved.")
-            refresh()
+            # A slow submit with no visible disable can be re-triggered by a
+            # double-click; guard the same way "Add purchase order" already
+            # does, so a resubmit doesn't duplicate the variation.
+            if not safe_df_query(
+                "SELECT id FROM job_variations WHERE job_id = ? AND LOWER(variation_no) = LOWER(?)",
+                (job_id, variation_no),
+            ).empty:
+                pb_error("This job already has that Variation No.")
+            else:
+                execute("""
+                    INSERT INTO job_variations
+                    (job_id, variation_no, description, reason, amount_ex_gst, status, sent_date, approved_date, approved_by, notes, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (job_id, variation_no, description, reason, amount, status, sent_date, approved_date, approved_by, notes, jobhub_now().strftime("%Y-%m-%d %H:%M:%S")))
+                pb_success("Variation saved.")
+                refresh()
 
     variations = df_query("""
         SELECT v.id AS 'ID',
@@ -18860,13 +18891,22 @@ def pb_control_invoice_claims():
             notes = st.text_area("Notes")
             submitted = st.form_submit_button("Save Claim")
         if submitted:
-            execute("""
-                INSERT INTO invoice_claims
-                (job_id, claim_no, description, amount_ex_gst, invoice_date, due_date, paid_date, status, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (job_id, claim_no, description, amount, invoice_date, due_date, paid_date, status, notes, jobhub_now().strftime("%Y-%m-%d %H:%M:%S")))
-            pb_success("Invoice / claim saved.")
-            refresh()
+            # A slow submit with no visible disable can be re-triggered by a
+            # double-click; guard the same way "Add purchase order" already
+            # does, so a resubmit doesn't duplicate the claim.
+            if not safe_df_query(
+                "SELECT id FROM invoice_claims WHERE job_id = ? AND LOWER(claim_no) = LOWER(?)",
+                (job_id, claim_no),
+            ).empty:
+                pb_error("This job already has that Claim / Invoice No.")
+            else:
+                execute("""
+                    INSERT INTO invoice_claims
+                    (job_id, claim_no, description, amount_ex_gst, invoice_date, due_date, paid_date, status, notes, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (job_id, claim_no, description, amount, invoice_date, due_date, paid_date, status, notes, jobhub_now().strftime("%Y-%m-%d %H:%M:%S")))
+                pb_success("Invoice / claim saved.")
+                refresh()
 
     claims = df_query("""
         SELECT c.id AS 'ID',
