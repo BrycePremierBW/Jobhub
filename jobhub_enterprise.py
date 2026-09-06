@@ -1213,11 +1213,26 @@ def render_procurement(ctx: dict[str, Any]) -> None:
                 },
             )
             invoice_subtotal = sum(_f(r.get("Invoice Line Total Ex GST")) for _, r in invoice_lines.iterrows())
-            variance = invoice_subtotal - _f(po_row["subtotal_ex_gst"])
-            x1, x2, x3 = st.columns(3)
+            # Compare against what's left to invoice on this PO, not its full
+            # subtotal every time. A PO legitimately gets invoiced in several
+            # partial deliveries; comparing each new invoice to the whole
+            # subtotal always showed roughly the same "variance" regardless
+            # of what earlier invoices already covered, giving no signal
+            # that a PO was being invoiced twice over (or under-invoiced).
+            already_invoiced = _f(
+                _query(
+                    ctx,
+                    "SELECT COALESCE(SUM(subtotal_ex_gst), 0) AS total FROM supplier_invoices WHERE purchase_order_id = ?",
+                    (po_id,),
+                ).iloc[0]["total"]
+            )
+            remaining_balance = _f(po_row["subtotal_ex_gst"]) - already_invoiced
+            variance = invoice_subtotal - remaining_balance
+            x1, x2, x3, x4 = st.columns(4)
             x1.metric("PO subtotal", _money(po_row["subtotal_ex_gst"]))
-            x2.metric("Invoice subtotal", _money(invoice_subtotal))
-            x3.metric("Variance", _money(variance))
+            x2.metric("Already invoiced", _money(already_invoiced))
+            x3.metric("Invoice subtotal", _money(invoice_subtotal))
+            x4.metric("Variance vs. remaining balance", _money(variance))
             with st.form("enterprise_invoice_header"):
                 invoice_no = st.text_input("Supplier invoice number")
                 d1, d2 = st.columns(2)
