@@ -23876,14 +23876,27 @@ elif menu == "Dashboard":
 # =============================
 elif menu == "Jobs":
     st.header("Job Register")
-    builder_options = get_builder_options()
-    material_supplier_options = get_product_supplier_options()
-
-    tab_add, tab_edit, tab_remove, tab_archived, tab_search, tab_list = st.tabs(
-        ["Add Job", "Edit Job", "Remove / Archive", "Archived Jobs", "Search by Builder", "Job Register"]
+    # Each section is selected explicitly rather than rendered in eager
+    # Streamlit tabs -- a tabs widget's bodies all execute on every rerun
+    # regardless of which tab is visible, so every section's queries
+    # (including the two builder/material lookups below) used to run on
+    # every single Job Register page load. A radio with a key persists its
+    # selection across reruns natively (unlike a tabs widget, which needed
+    # navigation_state_guard's rerun-restore workaround for the same reason),
+    # so this needs no additional persistence guard (jobhub-audit-2026-09,
+    # JH-PERF-JOBS-001; the same fix already built and tested once in the
+    # now-dead jobhub/pages/jobs.py, never ported into this production path).
+    section = st.radio(
+        "Job register section",
+        ["Add Job", "Edit Job", "Remove / Archive", "Archived Jobs", "Search by Builder", "Job Register"],
+        horizontal=True,
+        key="job_register_section",
+        label_visibility="collapsed",
     )
 
-    with tab_add:
+    if section == "Add Job":
+        builder_options = get_builder_options()
+        material_supplier_options = get_product_supplier_options()
         st.subheader("Add New Job")
         with st.form("add_job_form"):
             col1, col2 = st.columns(2)
@@ -23955,7 +23968,9 @@ elif menu == "Jobs":
                     except Exception:
                         pb_error("That job number already exists or the job could not be saved. Use Edit Existing Job for updates.")
 
-    with tab_edit:
+    elif section == "Edit Job":
+        builder_options = get_builder_options()
+        material_supplier_options = get_product_supplier_options()
         st.subheader("Edit Existing Job")
         jobs_df = df_query("""
             SELECT j.*, COALESCE(bc.name, '') AS builder_name
@@ -24073,7 +24088,7 @@ elif menu == "Jobs":
                             pb_success(f"Updated job {edit_job_no}")
                             refresh()
 
-    with tab_remove:
+    elif section == "Remove / Archive":
         st.subheader("Remove or Archive Job")
         st.warning("If a job has wages, materials or equipment saved against it, archive it instead of deleting it.")
         jobs_df = df_query("SELECT id, job_no, job_name FROM jobs ORDER BY job_no")
@@ -24123,7 +24138,7 @@ elif menu == "Jobs":
                     pb_success("Job deleted.")
                 refresh()
 
-    with tab_archived:
+    elif section == "Archived Jobs":
         st.subheader("Archived Jobs")
 
         archived_df = df_query("""
@@ -24297,7 +24312,8 @@ elif menu == "Jobs":
                         refresh()
 
 
-    with tab_search:
+    elif section == "Search by Builder":
+        builder_options = get_builder_options()
         st.subheader("Search Job Numbers by Builder / Client")
         selected_builder = st.selectbox("Select Builder / Client", [""] + list(builder_options.keys()), key="job_search_builder")
         if selected_builder:
@@ -24316,7 +24332,7 @@ elif menu == "Jobs":
             if st.button("Open this builder/client in Job Lookup", key="open_search_builder_linked_view"):
                 go_to_linked_job_view(builder_id=builder_options[selected_builder], mode="Jobs by Builder / Client")
 
-    with tab_list:
+    elif section == "Job Register":
         st.subheader("Full Job Register")
         include_archived = st.checkbox("Show archived jobs in register", value=True)
         where_clause = "" if include_archived else "WHERE j.status != 'Archived'"
