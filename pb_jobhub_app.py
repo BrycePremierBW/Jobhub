@@ -6547,11 +6547,22 @@ def force_password_change():
             pb_rerun()
 
 
+# "Stay logged in on this device" tokens are bearer credentials stored in the
+# browser's localStorage indefinitely (see jobhub/persistent_login.py). Cap
+# how long a stolen or forgotten one stays valid, and never trust the cached
+# role/active snapshot for authorization -- always re-check against the live
+# app_users row so a deactivated or demoted account loses access immediately
+# on its next restore, not whenever that browser tab happens to be closed.
+_AUTH_TOKEN_MAX_AGE_DAYS = 30
+
+
 def _save_user_auth_token(token: str, user_dict: dict) -> None:
     if not token or not user_dict:
         return
     try:
-        data_json = json.dumps(user_dict)
+        payload = dict(user_dict)
+        payload["issued_at"] = jobhub_now().isoformat()
+        data_json = json.dumps(payload)
         key = f"auth_token:{token}"
         execute("DELETE FROM app_settings WHERE setting_key = ?", (key,))
         execute("INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?)", (key, data_json))
@@ -6564,13 +6575,52 @@ def _get_user_by_auth_token(token: str) -> dict | None:
         return None
     try:
         df = df_query("SELECT setting_value FROM app_settings WHERE setting_key = ?", (f"auth_token:{token}",))
-        if df is not None and not df.empty:
-            raw = str(df.iloc[0]["setting_value"] or "")
-            if raw:
-                return json.loads(raw)
+        if df is None or df.empty:
+            return None
+        raw = str(df.iloc[0]["setting_value"] or "")
+        if not raw:
+            return None
+        cached = json.loads(raw)
     except Exception:
-        pass
-    return None
+        return None
+
+    issued_at = _parse_timestamp(cached.get("issued_at"))
+    if not issued_at or jobhub_now() - issued_at > timedelta(days=_AUTH_TOKEN_MAX_AGE_DAYS):
+        _delete_user_auth_token(token)
+        return None
+
+    try:
+        user_id = int(cached.get("id"))
+    except (TypeError, ValueError):
+        _delete_user_auth_token(token)
+        return None
+
+    try:
+        live_df = df_query("""
+            SELECT u.id, u.username, u.role, u.employee_id, u.active,
+                   COALESCE(u.must_change_password, 0) AS must_change_password,
+                   e.name AS employee_name
+            FROM app_users u
+            LEFT JOIN employees e ON e.id = u.employee_id
+            WHERE u.id = ?
+        """, (user_id,))
+    except Exception:
+        return None
+
+    if live_df.empty or int(live_df.iloc[0]["active"] or 0) != 1:
+        # The account was deleted or deactivated since this token was issued.
+        _delete_user_auth_token(token)
+        return None
+
+    live = live_df.iloc[0]
+    return {
+        "id": int(live["id"]),
+        "username": str(live["username"]),
+        "role": str(live["role"]),
+        "employee_id": int(live["employee_id"]) if not pd.isna(live["employee_id"]) else None,
+        "employee_name": "" if pd.isna(live["employee_name"]) else str(live["employee_name"]),
+        "must_change_password": bool(int(live["must_change_password"] or 0)),
+    }
 
 
 def _delete_user_auth_token(token: str) -> None:
