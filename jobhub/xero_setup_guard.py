@@ -290,6 +290,14 @@ def render_xero_setup_panel() -> None:
     if st is None:
         return
 
+    from . import permission_policy_guard as _permissions
+
+    if not _permissions.has_permission(_permissions.current_role(), "setup.manage"):
+        # install_xero_setup_guard() always calls this after the wrapped
+        # render_subscriber_setup(), regardless of whether that function
+        # rendered anything, so this panel needs its own check too.
+        return
+
     st.divider()
     st.subheader("Xero connection")
     st.caption("Connect the subscriber's accounting organisation securely. JobHub never stores the Xero password and OAuth tokens are encrypted server-side.")
