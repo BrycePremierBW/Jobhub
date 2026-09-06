@@ -88,10 +88,31 @@ separate PlanReader 3D tool.
 | 7 | Bulk crew scheduling — transactional/deterministic partial reporting | [#119](https://github.com/BrycePremierBW/Jobhub/pull/119) | Merged, verified |
 | 5 | Configurable tax rate with document-level snapshots | [#120](https://github.com/BrycePremierBW/Jobhub/pull/120) | Merged, verified |
 | 4 | Price snapshots on material entries | [#121](https://github.com/BrycePremierBW/Jobhub/pull/121) | Merged, verified |
-| 1/2/3 | Procurement-authoritative Job Costs reconciliation | [#122](https://github.com/BrycePremierBW/Jobhub/pull/122) | In review |
-| 10 | Dead `jobhub/pages` code: inventory → port → test → remove | _pending_ | Not started |
-| 9 | Multi-tenant org-scoping design document | _pending_ | Not started |
+| 1/2/3 | Procurement-authoritative Job Costs reconciliation | [#122](https://github.com/BrycePremierBW/Jobhub/pull/122) | Merged, verified |
+| 9 | Multi-tenant org-scoping design document | [#123](https://github.com/BrycePremierBW/Jobhub/pull/123) | Merged (design only, no migration implemented) |
+| — | Test infra: CI silently never ran ~120 tests in 28 files | [#124](https://github.com/BrycePremierBW/Jobhub/pull/124) | Merged, verified |
+| 10 | Dead `jobhub/pages` code: prove dead + inventory (port/remove not yet done) | [#125](https://github.com/BrycePremierBW/Jobhub/pull/125) | Merged (inventory only; see follow-up below) |
 | 11 | Palm Lakes migration | **BLOCKED — do not touch** | N/A |
+
+**Follow-ups identified but not yet actioned (queued):**
+- Port the lazy-section-selector fix (from dead `jobhub/pages/jobs.py` +
+  `jobhub/pages/builders_clients.py`) into the live Job Register and
+  Builders & Clients pages in `pb_jobhub_app.py`, which still eagerly
+  execute every `st.tabs()` section's queries on every load. Needs its
+  own REPRODUCE (real query-count measurement) + coordination with
+  `_TRACKED_TAB_SETS`. See `docs/DEAD_CODE_INVENTORY_DECISION_10.md`.
+- `enterprise_job_cost_dataframe()` in `jobhub_enterprise.py` still uses
+  a `max()`-blend of material_entries/Procurement values rather than the
+  additive PO-link-exclusion reconciliation applied to
+  `job_cost_summary_dataframe()`/`pb_job_cost_frame()` in #122. Not
+  currently under-reporting, but not yet strictly Procurement-authoritative
+  per decision #1's letter. Natural to pair with the dead-code
+  consolidation work above (three job-cost implementations exist across
+  two files).
+- Decision #9's design is written; no phase of the actual multi-tenant
+  migration has been implemented. Phase 1 (move `ensure_organization_schema()`
+  out of the Xero-only lazy call site into core startup) is the
+  recommended next step whenever this is picked up.
 
 ---
 
@@ -376,4 +397,117 @@ across two files -- consolidating them, not just reconciling each
 independently, is the more durable fix and deserves its own scoped
 workstream rather than being folded into this one.
 
-**PR.** [#122](https://github.com/BrycePremierBW/Jobhub/pull/122)
+**PR.** [#122](https://github.com/BrycePremierBW/Jobhub/pull/122) — merged,
+post-merge CI verified green.
+
+### 2026-09-06 — Decision #9: multi-tenant organisation scoping design
+
+Design document only, no migration implemented. Investigated first and
+found JobHub already has a tenant-metadata foundation live in production
+(`jobhub/organization_schema_guard.py` -- `organizations`/
+`organization_settings`/`organization_integrations`, seeded with a single
+`premier-brushworks` org) but it is only invoked lazily from the Xero
+setup page, and no business-data table has an `organization_id` column
+anywhere. `docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md` lays out five
+independently-shippable phases from that starting point to genuine
+per-organisation isolation: (1) move the existing schema bootstrap to core
+startup; (2) `organization_id` on `app_users`, wired into decision #8's
+`_revalidate_session_user()`; (3) additive, nullable, backfilled
+`organization_id` on ~25 business-data tables with zero query-behaviour
+change; (4) enforce isolation one table/group at a time via a single
+scoped-query chokepoint plus a CI coverage test per table (explicitly not
+1000+ manual call-site edits, and explicitly not Postgres-only RLS, since
+JobHub also runs on SQLite for local dev/CI); (5) the actual onboarding
+flow, gated on every prior phase being verified in production. Also
+records two open business questions (shared reference data across orgs?
+cross-org reporting?) that need an answer before Phase 5.
+
+**PR.** [#123](https://github.com/BrycePremierBW/Jobhub/pull/123) — merged,
+post-merge CI verified green.
+
+### 2026-09-06 — Test infra: CI silently never ran ~120 tests in 28 files
+
+**Reproduce.** While starting the decision #10 dead-code inventory, found
+`tests/test_jobs_page_performance.py` uses bare pytest-style
+`def test_...():` functions, not `unittest.TestCase`. CI runs
+`python -m unittest discover -s tests -p "test_*.py"`; unittest's
+discovery silently collects **zero tests** from a module written that
+way -- no error, no warning. Grepped the whole `tests/` directory for
+files with `def test_` at module scope and no `TestCase` subclass: found
+**28 files** written this way, including `test_xero_oauth.py`,
+`test_subscriber_onboarding.py`, `test_timesheet_bulk_reassign.py`, and
+25 others -- meaning every test in every one of them has been running
+zero times, ever, despite `pytest` already being an installed dependency
+in the same CI job (just never invoked).
+
+**Fix.** Switched the "Run JobHub tests" CI step from `unittest discover`
+to `pytest tests/` -- a strict superset (pytest natively runs
+`unittest.TestCase`-based tests too). Running the real ~700-test suite
+this way surfaced two real, previously-invisible problems:
+1. Three tests failed against code already confirmed dead in the decision
+   #10 inventory (`jobhub/pages/dashboard.py`, `jobhub/pages/reports.py`).
+   Marked `@pytest.mark.skip` with an explicit reason rather than
+   "fixing" assertions against unmaintained, non-production code.
+2. `tests/test_setup_panels_role_check.py::...manager_role` failed only
+   under a full-suite run, never alone -- a genuine cross-test pollution
+   bug, invisible until these 28 files' tests started actually executing
+   for the first time. Root cause: the test patched each guard module's
+   `_st()` but not `current_role()` itself;
+   `jobhub.permission_policy_guard.current_role()` prefers
+   `pb_jobhub_app.current_role()` (real global session state) over its
+   own `_st()` mock whenever `pb_jobhub_app` is already imported (true
+   for virtually the whole suite), so leftover session state from an
+   unrelated, earlier-running test could silently make the mock
+   ineffective. Reproduced deterministically (import `pb_jobhub_app`,
+   set real `st.session_state["user"]["role"] = "employee"`, rerun the
+   test in isolation -- same failure). Fixed by patching
+   `jobhub.permission_policy_guard.current_role` directly -- the exact
+   attribute `setup_defaults_guard.py`/`subscriber_setup_guard.py`/
+   `xero_setup_guard.py` all resolve at call time via a fresh
+   `from . import permission_policy_guard as _permissions` -- removing
+   the dependency on `current_role()`'s internal fallback chain, and
+   therefore on test execution order, entirely.
+
+**Tests.** Full suite under the new runner: 703 passed, 3 skipped
+(confirmed-dead-code tests), 0 failed. Ruff clean. Smoke test renders all
+33 routes.
+
+**PR.** [#124](https://github.com/BrycePremierBW/Jobhub/pull/124) — merged,
+post-merge CI verified green.
+
+### 2026-09-06 — Decision #10: dead-code inventory (prove dead + inventory only)
+
+**Reproduce/investigate.** Confirmed via static import analysis that all
+19 `jobhub/pages/*` + sibling modules (~508 KB: `operations.py`,
+`documents.py`, `estimating.py`, `job_views.py`, `mapping.py`,
+`material_orders.py`, `navigation.py`, `control_centre.py`,
+`takeoff_pages.py`, `ai_tools.py`, plus 9 files under `jobhub/pages/`) are
+genuinely unreachable from the running app. Searched git history for
+every "fix"-labeled commit touching those files and found exactly one
+piece of work: PRs #93/#94 built and tested a lazy-section-selector
+replacement for eager `st.tabs()` in the dead `jobhub/pages/jobs.py` (Job
+Register) and `jobhub/pages/builders_clients.py` (Builders & Clients) --
+avoiding every tab's queries firing on every page load regardless of
+which tab the user is viewing. Directly confirmed against current
+`pb_jobhub_app.py` that **both live pages still have this exact
+problem** today: Job Register's `st.tabs([...6 sections...])` and
+Builders & Clients' `st.tabs([...5 sections...])` both still execute all
+sections' queries unconditionally on every load, for every one of the
+~14 staff.
+
+**Not done in this workstream (recorded as a follow-up, not implemented):**
+porting the fix. It intersects with this programme's own earlier
+tab-persistence work (`_TRACKED_TAB_SETS` in
+`jobhub/navigation_state_guard.py` tracks both of these exact tab sets)
+and deserves real before/after query-count measurement as its REPRODUCE
+step, not just a code-shape argument -- scoped as its own workstream in
+`docs/DEAD_CODE_INVENTORY_DECISION_10.md` rather than bundled here.
+Removal of the 19 dead files themselves is explicitly deferred until
+after that port lands and is verified, per decision #10's own ordering.
+
+**Tests.** N/A (documentation/inventory only, no application code
+changed). Full suite still green (703 passed, 3 skipped) since this PR
+touched no application code.
+
+**PR.** [#125](https://github.com/BrycePremierBW/Jobhub/pull/125) — merged,
+post-merge CI verified green.
