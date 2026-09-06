@@ -98,6 +98,7 @@ separate PlanReader 3D tool.
 | 10 | Equipment checklist save N+1 read-side fix | [#132](https://github.com/BrycePremierBW/Jobhub/pull/132) | Merged, verified |
 | 1/2/3 | Procurement reconciliation for `enterprise_job_cost_dataframe()` | [#133](https://github.com/BrycePremierBW/Jobhub/pull/133) | Merged, verified |
 | 9 | Multi-tenant Phase 1: bootstrap org schema at core startup | [#134](https://github.com/BrycePremierBW/Jobhub/pull/134) | Merged, verified |
+| 9 | Multi-tenant Phase 2: `organization_id` on `app_users` | [#136](https://github.com/BrycePremierBW/Jobhub/pull/136) | Merged, verified |
 | 11 | Palm Lakes migration | **BLOCKED — do not touch** | N/A |
 
 **Note on PR #99.** While checking for other open PRs, found
@@ -128,13 +129,16 @@ user's own PR to close or keep; flagged here rather than acted on.
   git "fix" history specifically and found only those; it did not rule
   out other value in the remaining ~17 files (see
   `docs/DEAD_CODE_INVENTORY_DECISION_10.md` section 5).
-- Decision #9's design is written and Phase 1 (tenant-metadata bootstrap
-  at core startup) is now live (#134). Phase 2 onward (organisation_id
-  on app_users, then the ~25 business-data tables, then enforcement, then
-  the actual onboarding flow) has not been started -- see
-  `docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md` for the full phased
-  plan. Do not create a second `organizations` row in production before
-  Phase 4 (enforcement) is complete for every table that needs it.
+- Decision #9's design is written; Phase 1 (tenant-metadata bootstrap at
+  core startup, #134) and Phase 2 (`organization_id` identity scoping on
+  `app_users`, #136) are now live. Phase 3 onward (additive, nullable,
+  backfilled `organization_id` on the ~25 business-data tables inventoried
+  in the design doc, then per-table enforcement via a scoped-query
+  chokepoint plus a CI coverage test, then the actual onboarding flow) has
+  not been started -- see `docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md`
+  for the full phased plan. Do not create a second `organizations` row in
+  production before Phase 4 (enforcement) is complete for every table
+  that needs it.
 
 ---
 
@@ -707,4 +711,51 @@ the new script intentionally not pytest-collected).
 **PR.** [#134](https://github.com/BrycePremierBW/Jobhub/pull/134) —
 merged, post-merge CI verified green. Phase 1 of
 `docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md` complete; Phases 2-5
+not started.
+
+### 2026-09-06 — Decision #9 Phase 2: identity scoping (`organization_id` on `app_users`)
+
+**Reproduce/design.** Added a one-time migration
+(`20260906_app_users_organization_id_v1`) to `apply_schema_migrations()`
+that adds `app_users.organization_id` and backfills existing rows onto
+the default org. Reordered `initialise_jobhub_runtime()` so Phase 1's
+`ensure_organization_schema()` runs first (the migration needs the
+default org's real id already to exist). While implementing, found a
+real gap the design doc's own phasing didn't spell out: because the
+backfill migration only ever runs once, any user created *after* it
+(starting with the very first server boot's own bootstrap admin, created
+by `seed_app_users()` moments after the migration fires against an
+still-empty `app_users` table) would get `organization_id = NULL`
+forever, silently defeating "every user belongs to an org" from day one
+of a fresh install. `pb_jobhub_app.py` runs its full startup
+automatically at module import time, so there is no way to import it
+fresh and separately drive individual startup steps in a custom order --
+both new checks build the "before this migration ever ran" database
+state by hand with raw `sqlite3`, *before* importing `pb_jobhub_app` at
+all, to genuinely reproduce what upgrading a real production database
+looks like. Confirmed both fail against pre-fix code with
+`no such column: organization_id`.
+
+**Fix.** `seed_app_users()`'s bootstrap-admin INSERT and the admin
+"Add User" panel's INSERT now both set `organization_id` themselves at
+creation time (the default org for the bootstrap admin since it's
+necessarily the first user; the creating admin's own org -- falling back
+to the default org -- for "Add User", so a session that predates Phase 2
+still works). `_revalidate_session_user()` (decision #8) now also reads
+and refreshes `organization_id` into session state every rerun, and the
+login flow populates it at sign-in. No business-data table is scoped by
+any of this yet, per the design doc's own phasing.
+
+**Tests.** `tests/run_app_users_organization_id_backfill_check.py` and
+`tests/run_bootstrap_admin_organization_id_check.py` (both standalone,
+fresh-process scripts, not pytest-collected, matching
+`run_organization_schema_startup_check.py`'s isolation reasoning) --
+both pass against the fix, both fail against pre-fix code. Full suite:
+722 tests green (unaffected; `organization_id` is additive to the
+session dict, no existing assertion depends on its exact shape). Ruff
+clean. Smoke test renders all 33 routes.
+
+**PR.** [#136](https://github.com/BrycePremierBW/Jobhub/pull/136) —
+merged, post-merge CI verified green. Phases 1-2 of
+`docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md` complete; Phases 3-5
 not started.
