@@ -199,8 +199,14 @@ def _combine_crews(primary: Any, setup: Any, active_only: bool) -> Any:
     work = primary.copy()
     if "source" not in work.columns:
         work["source"] = "Staff Scheduler"
-    if not active_only:
-        return work
+    # active_only is already applied to `setup` by the caller (_setup_crews_df
+    # filters on it via SQL), so there is nothing left for this function to
+    # gate on. It used to return `work` unmerged whenever active_only was
+    # False, which made every JobHub-Setup-sourced crew invisible on the
+    # "Saved crews" management screen (the one place that deliberately asks
+    # for active_only=False, specifically so it can list inactive crews too)
+    # even though the module's own docstring says either screen should show
+    # the same unified crew list.
     # JobHub Setup wins when the same crew name exists in both stores.
     setup_names = {str(name or "").strip().casefold() for name in setup.get("crew_name", [])}
     work = work[~work["crew_name"].astype(str).str.strip().str.casefold().isin(setup_names)]
