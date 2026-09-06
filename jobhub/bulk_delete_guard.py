@@ -15,6 +15,8 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from .po_admin_only_guard import is_admin, is_po_sensitive_text
+
 
 PALM_LAKES_CLEANUP_SETTING = "maintenance_palm_lakes_villas_consolidated_20260823"
 _palm_cleanup_checked = False
@@ -553,6 +555,13 @@ def _patch_dataframe(owner: Any, st: Any) -> bool:
         key = _normalise_key(kwargs.get("key"))
         target = _target_for_key(key)
         frame = _extract_frame(args, kwargs)
+        # jobhub.po_admin_only_guard hides PO-backed tables from non-admins by
+        # returning a restricted result instead of rendering the real table
+        # above. Without this check, this wrapper would still read the raw,
+        # unredacted frame straight out of the call arguments and render a
+        # fully working "bulk delete" panel underneath it for any role.
+        if target is not None and is_po_sensitive_text(key) and not is_admin(st):
+            return result
         if target is not None and frame is not None:
             try:
                 _render_bulk_delete_controls(st, frame, key, target)
