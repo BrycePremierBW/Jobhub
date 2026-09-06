@@ -1416,8 +1416,27 @@ def _render_form_submission(ctx: dict[str, Any], key_prefix: str, default_job_id
         try:
             if not acknowledgement:
                 raise ValueError("Confirm that the record is accurate before submitting.")
+            if not signature.strip():
+                raise ValueError("Enter who is submitting / signing this record.")
             user = _user(ctx)
             employee_id = user.get("employee_id")
+            # A double-click or a resubmit after a slow response has no
+            # uniqueness constraint to stop it (unlike a PO/variation number),
+            # and re-submitting the identical answers is never a legitimate
+            # separate record -- so guard on the exact submitted content
+            # rather than imposing a one-per-day business rule this form
+            # doesn't otherwise have (a second genuine Hazard / Incident
+            # Report for the same job on the same day must still go through).
+            submission_signature = (
+                job_id, form_type, _today(),
+                json.dumps(answers, sort_keys=True), signature.strip(),
+            )
+            submitted_signatures = st.session_state.setdefault(
+                "_pb_field_form_submitted_signatures", set()
+            )
+            if submission_signature in submitted_signatures:
+                ctx["pb_error"]("This exact form was already submitted. Change an answer, or it's already recorded.")
+                return
             _execute(
                 ctx,
                 """
@@ -1442,6 +1461,7 @@ def _render_form_submission(ctx: dict[str, Any], key_prefix: str, default_job_id
                     "field_form",
                     form_id,
                 )
+            submitted_signatures.add(submission_signature)
             ctx["pb_success"](f"{form_type} was submitted successfully.")
             ctx["pb_rerun"]()
         except Exception as exc:
