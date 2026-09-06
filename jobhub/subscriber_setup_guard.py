@@ -423,6 +423,13 @@ def render_subscriber_setup() -> None:
     st = _st()
     if st is None:
         return
+    from . import permission_policy_guard as _permissions
+
+    if not _permissions.has_permission(_permissions.current_role(), "setup.manage"):
+        # install_subscriber_setup_guard() always calls this after the
+        # wrapped render_setup_defaults_page(), regardless of whether that
+        # function rendered anything, so this panel needs its own check too.
+        return
     _ensure_schema()
     _load_brand_into_session(st)
     st.divider()

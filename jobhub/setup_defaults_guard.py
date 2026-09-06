@@ -404,6 +404,11 @@ def render_setup_defaults_page() -> None:
     st = _st()
     if st is None:
         return
+    from . import permission_policy_guard as _permissions
+
+    if not _permissions.has_permission(_permissions.current_role(), "setup.manage"):
+        st.info("JobHub Setup / Edit Defaults is visible to admin and manager accounts only.")
+        return
     _ensure_schema()
     st.header("JobHub Setup / Edit Defaults")
     st.caption("Admin controls for the defaults JobHub starts with: estimating rates, progress assumptions, stage splits and crews.")
