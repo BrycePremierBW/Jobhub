@@ -84,9 +84,10 @@ separate PlanReader 3D tool.
 | # | Decision | PR | Status |
 |---|----------|----|--------|
 | 8 | Server-side role revalidation before privileged mutations | [#117](https://github.com/BrycePremierBW/Jobhub/pull/117) | Merged, verified |
-| 6 | Scheduling TOCTOU double-booking fix | [#118](https://github.com/BrycePremierBW/Jobhub/pull/118) | In review |
-| 7 | Bulk crew scheduling — transactional/deterministic partial reporting | [#119](https://github.com/BrycePremierBW/Jobhub/pull/119) | In review |
-| 4/5 | Price snapshots on material entries + configurable tax rate | _pending_ | Not started |
+| 6 | Scheduling TOCTOU double-booking fix | [#118](https://github.com/BrycePremierBW/Jobhub/pull/118) | Merged, verified |
+| 7 | Bulk crew scheduling — transactional/deterministic partial reporting | [#119](https://github.com/BrycePremierBW/Jobhub/pull/119) | Merged, verified |
+| 5 | Configurable tax rate with document-level snapshots | [#120](https://github.com/BrycePremierBW/Jobhub/pull/120) | In review |
+| 4 | Price snapshots on material entries | _pending_ | Not started |
 | 1/2/3 | Procurement-authoritative Job Costs reconciliation | _pending_ | Not started |
 | 10 | Dead `jobhub/pages` code: inventory → port → test → remove | _pending_ | Not started |
 | 9 | Multi-tenant org-scoping design document | _pending_ | Not started |
@@ -208,4 +209,49 @@ skipped (no regression on the happy path). Full suite: 565 tests green
 (rebased cleanly onto #118's TOCTOU fix in the same file). Ruff clean.
 Smoke test renders all 33 routes.
 
-**PR.** [#119](https://github.com/BrycePremierBW/Jobhub/pull/119)
+**PR.** [#119](https://github.com/BrycePremierBW/Jobhub/pull/119) — merged,
+post-merge CI verified green.
+
+### 2026-09-06 — Decision #5: configurable tax rate with document-level snapshots
+
+**Reproduce.** `_create_purchase_order()` and the "Supplier Invoice Match"
+handler in `render_procurement()` (both in `jobhub_enterprise.py`) each
+computed GST with a bare `subtotal * 0.10` / `invoice_subtotal * 0.10` —
+no admin-configurable rate existed anywhere, and since the rate was never
+stored on the document itself, a future edit to that source constant would
+have silently changed the recorded total on every *existing* PO/invoice as
+well as new ones. Wrote `tests/test_configurable_gst_snapshot.py` (6
+tests); confirmed all 6 fail against pre-fix code — `no such column:
+gst_percent` (the column didn't exist yet) and `substring not found` (the
+snapshotted-rate read in supplier-invoice matching didn't exist yet) — not
+a source-string check, a genuine absence of the feature.
+
+**Fix.** Added a `gst_percent REAL DEFAULT 10` column to both
+`purchase_orders` and `supplier_invoices` (`_ensure_gst_percent_columns()`,
+same `ALTER TABLE ADD COLUMN IF NOT EXISTS` + `PRAGMA table_info` fallback
+pattern as the existing GPS-columns migration). Added
+`_default_gst_percent(ctx)`, reading an admin-configurable
+`app_settings.default_gst_percent` row (default 10.0 if unset) — the same
+`app_settings` key/value table already used for staff rates etc.
+`_create_purchase_order()` now snapshots this rate onto the new PO at
+creation time instead of hardcoding 10%. Supplier-invoice matching now
+reads the *PO's own* snapshotted `gst_percent` (not a fresh read of the
+current system default, and not a hardcoded 10%) so an invoice against an
+older PO keeps using the rate that PO was raised under even if the system
+default has since changed — the same "never retroactively change an
+existing document" principle as decision #4's price snapshots. Exposed
+"Default GST / tax rate %" on the JobHub Setup → Rates tab
+(`jobhub/setup_defaults_guard.py`), following the exact existing pattern
+for `default_staff_hourly_rate`, so the rate is genuinely admin-editable
+rather than only a source-level fallback constant.
+
+**Tests.** `tests/test_configurable_gst_snapshot.py` — default fallback to
+10.0 when unset; reads a configured setting; a new PO snapshots the
+configured rate at creation; changing the system default *afterward* does
+not alter an already-created PO's stored `gst_percent`/`gst_amount`/
+`total_inc_gst`; supplier-invoice matching uses the PO's own snapshotted
+rate, including a missing-rate fallback to 10%. Full suite: 571 tests
+green (rebased cleanly onto #119). Ruff (`F821`/`F823`) clean. Smoke test
+renders all 33 routes.
+
+**PR.** [#120](https://github.com/BrycePremierBW/Jobhub/pull/120)
