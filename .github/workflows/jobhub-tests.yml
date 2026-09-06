@@ -59,6 +59,8 @@ jobs:
         run: PYTHONPATH=. python tests/test_job_delete_integrity_postgres.py
       - name: Run material order workflow
         run: python tests/material_order_workflow_test.py
+      - name: Run organisation schema startup bootstrap check
+        run: python tests/run_organization_schema_startup_check.py
       - name: Render every JobHub route
         run: python tests/smoke_test.py
       - name: Run populated staged-job workflow
