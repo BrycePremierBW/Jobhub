@@ -2356,13 +2356,37 @@ def page_leave(user: dict) -> None:
                         jobhub_now().isoformat(timespec="seconds"),
                     ),
                 )
-                pb_success("Leave request saved.")
+                message = "Leave request saved."
+                if status == "Approved":
+                    # pb_rerun() only replays success/error feedback across
+                    # the immediate rerun (see jobhub_feedback.py), so a
+                    # separate st.warning() call here would flash and vanish
+                    # before anyone could read it -- fold the conflict note
+                    # into the persisted success message instead.
+                    conflicts = query_df(
+                        """
+                        SELECT j.job_no,s.schedule_date
+                        FROM staff_schedule s JOIN jobs j ON j.id=s.job_id
+                        WHERE s.employee_id=? AND s.schedule_date BETWEEN ? AND ?
+                        ORDER BY s.schedule_date
+                        """,
+                        (employee_id, to_date(start_date).isoformat(), to_date(end_date).isoformat()),
+                    )
+                    if not conflicts.empty:
+                        conflict_text = ", ".join(
+                            f"{row['job_no']} on {row['schedule_date']}" for _, row in conflicts.iterrows()
+                        )
+                        message += (
+                            f" Note: {employee_name} is already rostered during this leave window: "
+                            f"{conflict_text}. This leave request does not remove those bookings."
+                        )
+                pb_success(message)
                 pb_rerun()
 
     with tab_review:
         pending = query_df(
             """
-            SELECT l.id,e.name AS staff,l.start_date,l.end_date,l.leave_type,l.reason,l.created_at
+            SELECT l.id,l.employee_id,e.name AS staff,l.start_date,l.end_date,l.leave_type,l.reason,l.created_at
             FROM staff_leave_requests l JOIN employees e ON e.id=l.employee_id
             WHERE LOWER(l.status)='pending' ORDER BY l.start_date
             """
@@ -2377,6 +2401,30 @@ def page_leave(user: dict) -> None:
             request_id = int(selected.split(" · ", 1)[0].replace("#", ""))
             selected_row = pending[pending["id"] == request_id].iloc[0]
             st.write(selected_row["reason"] or "No reason supplied.")
+            # Nothing else checks this: approving leave never looked at
+            # whether the employee already has schedule bookings inside the
+            # leave window, so a staff member could end up simultaneously
+            # "on approved leave" and rostered to a job with no warning
+            # anywhere. This is informational only -- it doesn't block or
+            # touch the existing bookings, since deciding whether to
+            # unassign them is a call for whoever is approving the leave.
+            conflicts = query_df(
+                """
+                SELECT j.job_no,j.job_name,s.schedule_date
+                FROM staff_schedule s JOIN jobs j ON j.id=s.job_id
+                WHERE s.employee_id=? AND s.schedule_date BETWEEN ? AND ?
+                ORDER BY s.schedule_date
+                """,
+                (int(selected_row["employee_id"]), str(selected_row["start_date"]), str(selected_row["end_date"])),
+            )
+            if not conflicts.empty:
+                conflict_text = ", ".join(
+                    f"{row['job_no']} on {row['schedule_date']}" for _, row in conflicts.iterrows()
+                )
+                st.warning(
+                    f"{selected_row['staff']} is already rostered during this leave window: {conflict_text}. "
+                    "Approving leave does not remove these bookings -- update the schedule separately if needed."
+                )
             c1, c2 = st.columns(2)
             if c1.button("Approve", type="primary", width="stretch"):
                 execute(
