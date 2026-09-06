@@ -48,7 +48,7 @@ jobs:
       - name: Check undefined names and local-scope errors
         run: ruff check . --select F821,F823
       - name: Run JobHub tests
-        run: python -m unittest discover -s tests -p "test_*.py" -v
+        run: python -m pytest tests/ -v
       - name: Run PostgreSQL integration smoke
         env:
           JOBHUB_POSTGRES_CI_URL: postgresql://postgres:postgres@127.0.0.1:5432/jobhub_ci

@@ -13,6 +13,25 @@ the subscriber and Xero panels chained after it would still render unless
 each of them also checks the role itself. This mirrors the pattern already
 used correctly elsewhere in the app (e.g. blip_integration_guard's
 _allowed() check inside render_blip_attendance_page).
+
+Every test here also patches jobhub.permission_policy_guard.current_role
+directly, not just each guard module's _st(). setup_defaults_guard.py,
+subscriber_setup_guard.py and xero_setup_guard.py all resolve the caller's
+role via a fresh `from . import permission_policy_guard as _permissions`
+then `_permissions.current_role()` at call time -- and current_role()
+itself prefers pb_jobhub_app.current_role() (if pb_jobhub_app is already
+imported, true for virtually the whole suite) over its own _st() mock.
+Patching only _st() here left this test's outcome dependent on whatever
+role real global state (pb_jobhub_app's session state, or other cached
+state reachable from current_role()) happened to hold, left over from an
+unrelated, earlier-running test elsewhere in the full suite. It passed in
+isolation and under `python -m unittest discover` (which never actually
+executed this file's sibling bare-function test modules, so that global
+state was never mutated first) but failed under a full pytest run once
+those modules started actually running. Patching current_role() itself,
+at the exact module attribute _permissions.current_role() looks up,
+removes the dependency on any of current_role()'s own internal fallback
+chain -- and therefore on test execution order -- entirely.
 """
 from __future__ import annotations
 
@@ -59,6 +78,7 @@ class SetupPanelsRoleCheckTests(unittest.TestCase):
              mock.patch.object(sys.modules["jobhub.setup_defaults_guard"], "_st", return_value=fake_st), \
              mock.patch.object(sys.modules["jobhub.subscriber_setup_guard"], "_st", return_value=fake_st), \
              mock.patch.object(sys.modules["jobhub.xero_setup_guard"], "_st", return_value=fake_st), \
+             mock.patch("jobhub.permission_policy_guard.current_role", return_value=role), \
              mock.patch(ensure_schema_target, side_effect=AssertionError(
                  f"{ensure_schema_target} ran even though the caller is role={role!r}"
              )):
@@ -85,6 +105,7 @@ class SetupPanelsRoleCheckTests(unittest.TestCase):
              mock.patch.object(sys.modules["jobhub.setup_defaults_guard"], "_st", return_value=fake_st), \
              mock.patch.object(sys.modules["jobhub.subscriber_setup_guard"], "_st", return_value=fake_st), \
              mock.patch.object(sys.modules["jobhub.xero_setup_guard"], "_st", return_value=fake_st), \
+             mock.patch("jobhub.permission_policy_guard.current_role", return_value="manager"), \
              mock.patch("jobhub.setup_defaults_guard._ensure_schema"), \
              mock.patch("jobhub.setup_defaults_guard._render_rates_tab"), \
              mock.patch("jobhub.setup_defaults_guard._render_stage_tab"), \
@@ -117,6 +138,7 @@ class SetupPanelsRoleCheckTests(unittest.TestCase):
         fake_st = FakeStreamlit("employee")
         with mock.patch.object(sys.modules["jobhub.permission_policy_guard"], "_st", return_value=fake_st), \
              mock.patch.object(sys.modules["jobhub.xero_setup_guard"], "_st", return_value=fake_st), \
+             mock.patch("jobhub.permission_policy_guard.current_role", return_value="employee"), \
              mock.patch("jobhub.xero_setup_guard._ensure_org", side_effect=AssertionError(
                  "xero_setup_guard._ensure_org ran even though the caller is role='employee'"
              )):
