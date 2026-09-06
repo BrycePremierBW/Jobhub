@@ -284,6 +284,15 @@ def _sync_external_from_estimate(context, job_id, estimate_id, username):
     updates = []
     inserts = []
     added = 0
+    source_line_ids = {int(row["id"]) for _, row in source.iterrows()}
+    # If job_progress_settings.linked_estimate_id was switched to a new
+    # estimate revision, rows synced from the *previous* estimate's line
+    # items are otherwise never removed: they don't match any current
+    # source["id"], so they're neither updated nor deleted, and _summary()
+    # sums every job_external_progress row for the job regardless of which
+    # estimate produced it -- silently inflating (or, if the stale rows
+    # showed less progress, deflating) the reported external m2/percentage.
+    stale_line_ids = [line_id for line_id in existing if line_id not in source_line_ids]
     for _, row in source.iterrows():
         line_id = int(row["id"])
         area_name = str(row["description"] or "External area")
@@ -335,6 +344,14 @@ def _sync_external_from_estimate(context, job_id, estimate_id, username):
         else:
             for params in inserts:
                 context["execute"](sql, params)
+    if stale_line_ids:
+        delete_sql = "DELETE FROM job_external_progress WHERE job_id=? AND estimate_line_id=?"
+        delete_params = [(job_id, line_id) for line_id in stale_line_ids]
+        if execute_many:
+            execute_many(delete_sql, delete_params)
+        else:
+            for params in delete_params:
+                context["execute"](delete_sql, params)
     return added
 
 
