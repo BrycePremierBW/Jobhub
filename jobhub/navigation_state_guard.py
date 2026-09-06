@@ -79,13 +79,11 @@ _TRACKED_TAB_SETS = (
     # which persists its own selection across reruns natively.
     frozenset({"Add", "Edit", "Remove / Deactivate", "List"}),
     frozenset({"Edit selected line", "Delete selected line"}),
-    frozenset({
-        "Import Filled PDF Checklist",
-        "Job Equipment Checklist",
-        "Job Equipment Master List",
-        "All Saved Equipment",
-        "Manage Checklist Items",
-    }),
+    # Equipment no longer uses a tabs widget -- converted to a lazy
+    # st.radio(key="equipment_section") selector alongside Job Register
+    # and Builders & Clients (jobhub-audit-2026-09, JH-PERF-JOBS-001
+    # follow-up), which persists its own selection across reruns
+    # natively.
     frozenset({"Job Pack by Job", "General Reports"}),
     frozenset({
         "Create Purchase Order",

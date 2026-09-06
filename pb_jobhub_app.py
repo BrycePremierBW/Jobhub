@@ -25787,14 +25787,28 @@ elif menu == "Timesheets":
 
 elif menu == "Equipment":
     st.header("Equipment")
-
-    job_options = get_job_options()
-
-    tab_import, tab_checklist, tab_master, tab_saved, tab_items = st.tabs(
-        ["Import Filled PDF Checklist", "Job Equipment Checklist", "Job Equipment Master List", "All Saved Equipment", "Manage Checklist Items"]
+    # Each section is selected explicitly rather than rendered in eager
+    # Streamlit tabs -- a tabs widget's bodies all execute on every rerun
+    # regardless of which tab is visible, so every one of this page's five
+    # sections (including the job-options lookup below, needed by three
+    # of them) used to run its own queries on every single load. A radio
+    # with a key persists its selection across reruns natively (unlike a
+    # tabs widget, which needed navigation_state_guard's rerun-restore
+    # workaround for the same reason), so this needs no additional
+    # persistence guard (jobhub-audit-2026-09, JH-PERF-JOBS-001 follow-up;
+    # the same class of fix was drafted once for this page's dead
+    # jobhub/pages/equipment.py counterpart in the still-open, never
+    # merged PR #99, but never ported into this production path).
+    section = st.radio(
+        "Equipment section",
+        ["Import Filled PDF Checklist", "Job Equipment Checklist", "Job Equipment Master List", "All Saved Equipment", "Manage Checklist Items"],
+        horizontal=True,
+        key="equipment_section",
+        label_visibility="collapsed",
     )
 
-    with tab_import:
+    if section == "Import Filled PDF Checklist":
+        job_options = get_job_options()
         st.subheader("Import Filled Master Site Checklist PDF")
         st.caption("Upload the completed fillable PDF checklist and assign it to the correct job. Imported quantities will save to that selected job only.")
 
@@ -25871,7 +25885,8 @@ elif menu == "Equipment":
                     pb_error(f"Could not import this PDF checklist: {e}")
 
 
-    with tab_checklist:
+    elif section == "Job Equipment Checklist":
+        job_options = get_job_options()
         st.subheader("Fill Out Equipment Checklist")
         if not job_options:
             st.info("Create a job first.")
@@ -26009,7 +26024,8 @@ elif menu == "Equipment":
                     pb_success("Equipment checklist saved to the selected job.")
                     refresh()
 
-    with tab_master:
+    elif section == "Job Equipment Master List":
+        job_options = get_job_options()
         st.subheader("Job Equipment Master List")
         if not job_options:
             st.info("Create a job first.")
@@ -26062,7 +26078,7 @@ elif menu == "Equipment":
                     mime="text/csv",
                 )
 
-    with tab_saved:
+    elif section == "All Saved Equipment":
         st.subheader("All Saved Equipment Checklist Records")
         all_df = df_query("""
             SELECT r.id AS 'Record ID',
@@ -26111,7 +26127,7 @@ elif menu == "Equipment":
                         pb_success("Equipment line deleted.")
                         refresh()
 
-    with tab_items:
+    elif section == "Manage Checklist Items":
         st.subheader("Manage Checklist Items")
         with st.form("add_equipment_item_form"):
             col1, col2, col3 = st.columns(3)
