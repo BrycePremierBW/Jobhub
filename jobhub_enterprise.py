@@ -1128,7 +1128,32 @@ def render_procurement(ctx: dict[str, Any]) -> None:
                 "PO status", ["Requested", "Approved", "Ordered", "Part Received", "Received", "Closed", "Cancelled"],
                 key=f"enterprise_po_status_{po_id}",
             )
-            if st.button("Save Receiving / Status", key=f"enterprise_po_save_{po_id}", width="stretch"):
+            # st.column_config can't cap Received Qty per-row against that
+            # row's own Ordered Qty (max_value is fixed for the whole
+            # column), so a typo (100 instead of 10) previously saved
+            # silently with no signal at all. Flag it and require an
+            # explicit confirmation rather than blocking outright -- a
+            # genuine over-delivery is a real possibility in this industry.
+            over_received = edited_lines[
+                edited_lines["Received Qty"].fillna(0) > edited_lines["Ordered Qty"].fillna(0)
+            ]
+            confirm_over_receipt = True
+            if not over_received.empty:
+                over_lines = ", ".join(
+                    f"{row['Description']} (received {row['Received Qty']:g} of {row['Ordered Qty']:g} ordered)"
+                    for _, row in over_received.iterrows()
+                )
+                st.warning(f"Received quantity exceeds what was ordered: {over_lines}.")
+                confirm_over_receipt = st.checkbox(
+                    "I confirm these received quantities above the ordered amount are correct.",
+                    key=f"enterprise_po_confirm_over_receipt_{po_id}",
+                )
+            if st.button(
+                "Save Receiving / Status",
+                key=f"enterprise_po_save_{po_id}",
+                width="stretch",
+                disabled=not confirm_over_receipt,
+            ):
                 try:
                     conn = ctx["connect"]()
                     cur = conn.cursor()
