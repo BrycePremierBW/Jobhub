@@ -719,17 +719,50 @@ def leave_rows(start: date, end: date, employee_id: int | None = None) -> pd.Dat
     return query_df(sql, params)
 
 
-def has_approved_leave(employee_id: int, work_date: date) -> bool:
-    return bool(
-        scalar(
-            """
-            SELECT COUNT(*) FROM staff_leave_requests
-            WHERE employee_id=? AND LOWER(status)='approved' AND ? BETWEEN start_date AND end_date
-            """,
-            (employee_id, work_date.isoformat()),
-            0,
-        )
-    )
+def has_approved_leave(employee_id: int, work_date: date, cur=None) -> bool:
+    sql = """
+        SELECT COUNT(*) FROM staff_leave_requests
+        WHERE employee_id=? AND LOWER(status)='approved' AND ? BETWEEN start_date AND end_date
+    """
+    params = (employee_id, work_date.isoformat())
+    if cur is not None:
+        # Reuse the caller's already-locked transaction/cursor (see
+        # _serialize_employee_schedule_writes) instead of opening a second,
+        # unlocked connection that would check stale/unlocked data.
+        cur.execute(sql_text(sql), params)
+        row = cur.fetchone()
+        return bool(row[0] if row else 0)
+    return bool(scalar(sql, params, 0))
+
+
+def _serialize_employee_schedule_writes(cur, employee_id: int) -> None:
+    """Close the check-then-insert race for one employee's schedule.
+
+    overlapping_assignment()/has_approved_leave() and the subsequent INSERT
+    used to run as separate, unlocked statements -- on Postgres even as
+    separate pooled connections. Two concurrent requests booking the same
+    employee for an overlapping slot could both pass the overlap check
+    before either committed its write, producing a genuine double-booking.
+    Call this first, inside the same transaction that will perform the
+    check and the write, to serialize concurrent attempts for this employee.
+
+    Postgres: an advisory lock keyed on the employee id blocks a concurrent
+    transaction doing the same for the same employee, even when neither has
+    any existing schedule row yet to lock via a row-level SELECT ... FOR
+    UPDATE. It is transaction-scoped -- released automatically on commit or
+    rollback, never needs an explicit unlock.
+
+    SQLite: forces an immediate write-intent lock before the read-check
+    (rather than the default deferred transaction, which only locks at the
+    first write) so a concurrent connection attempting the same for *any*
+    employee blocks until this transaction commits. Coarser than Postgres's
+    per-employee lock, but SQLite here only ever backs local/CI runs, never
+    concurrent production traffic.
+    """
+    if USE_POSTGRES:
+        cur.execute(sql_text("SELECT pg_advisory_xact_lock(?)"), (int(employee_id),))
+    else:
+        cur.execute("BEGIN IMMEDIATE")
 
 
 def overlapping_assignment_rows(
@@ -738,6 +771,7 @@ def overlapping_assignment_rows(
     start_value: time,
     finish_value: time,
     exclude_id: int | None = None,
+    cur=None,
 ) -> pd.DataFrame:
     stages_available = table_exists("job_stages")
     stage_select = "COALESCE(js.stage_name,'Whole Job')" if stages_available else "'Whole Job'"
@@ -766,6 +800,14 @@ def overlapping_assignment_rows(
         sql += " AND s.id<>?"
         params.append(int(exclude_id))
     sql += " ORDER BY s.start_time, s.id"
+    if cur is not None:
+        # Reuse the caller's already-locked transaction/cursor (see
+        # _serialize_employee_schedule_writes) instead of opening a second,
+        # unlocked connection that would check stale/unlocked data.
+        cur.execute(sql_text(sql), params)
+        rows = cur.fetchall()
+        columns = [item[0] for item in cur.description] if cur.description else []
+        return pd.DataFrame(rows, columns=columns)
     return query_df(sql, params)
 
 
@@ -775,6 +817,7 @@ def overlapping_assignment(
     start_value: time,
     finish_value: time,
     exclude_id: int | None = None,
+    cur=None,
 ) -> bool:
     return not overlapping_assignment_rows(
         employee_id,
@@ -782,6 +825,7 @@ def overlapping_assignment(
         start_value,
         finish_value,
         exclude_id,
+        cur=cur,
     ).empty
 
 
@@ -813,39 +857,49 @@ def add_assignment(
 ) -> tuple[bool, str]:
     if finish_value <= start_value:
         return False, "Finish time must be after start time."
-    if has_approved_leave(employee_id, work_date):
-        return False, "Staff member is on approved leave."
-    if overlapping_assignment(employee_id, work_date, start_value, finish_value):
-        return False, "Staff member already has an overlapping assignment."
     job_start, day_offset = job_date_linkage(job_id, work_date, linked_to_job_dates)
-    execute(
-        """
-        INSERT INTO staff_schedule
-        (job_id,job_stage_id,employee_id,schedule_date,start_time,finish_time,site_role,notes,created_at,
-         period_type,period_start,period_end,planned_hours,created_by,
-         linked_to_job_dates,job_day_offset,last_job_start_date)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            job_id,
-            job_stage_id,
-            employee_id,
-            work_date.isoformat(),
-            start_value.strftime("%H:%M"),
-            finish_value.strftime("%H:%M"),
-            site_role,
-            notes.strip(),
-            jobhub_now().isoformat(timespec="seconds"),
-            "Day",
-            work_date.isoformat(),
-            work_date.isoformat(),
-            float(planned_hours),
-            created_by,
-            1 if linked_to_job_dates and job_start is not None else 0,
-            day_offset,
-            job_start.isoformat() if job_start else None,
-        ),
-    )
+    # The leave/overlap checks and the insert all run inside one locked
+    # transaction (see _serialize_employee_schedule_writes) so a concurrent
+    # add_assignment for the same employee cannot commit an overlapping
+    # booking between this check and this insert.
+    with db_conn() as conn:
+        cur = conn.cursor()
+        _serialize_employee_schedule_writes(cur, employee_id)
+        if has_approved_leave(employee_id, work_date, cur=cur):
+            return False, "Staff member is on approved leave."
+        if overlapping_assignment(employee_id, work_date, start_value, finish_value, cur=cur):
+            return False, "Staff member already has an overlapping assignment."
+        cur.execute(
+            sql_text(
+                """
+                INSERT INTO staff_schedule
+                (job_id,job_stage_id,employee_id,schedule_date,start_time,finish_time,site_role,notes,created_at,
+                 period_type,period_start,period_end,planned_hours,created_by,
+                 linked_to_job_dates,job_day_offset,last_job_start_date)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """
+            ),
+            (
+                job_id,
+                job_stage_id,
+                employee_id,
+                work_date.isoformat(),
+                start_value.strftime("%H:%M"),
+                finish_value.strftime("%H:%M"),
+                site_role,
+                notes.strip(),
+                jobhub_now().isoformat(timespec="seconds"),
+                "Day",
+                work_date.isoformat(),
+                work_date.isoformat(),
+                float(planned_hours),
+                created_by,
+                1 if linked_to_job_dates and job_start is not None else 0,
+                day_offset,
+                job_start.isoformat() if job_start else None,
+            ),
+        )
+        notify_db_write("INSERT INTO staff_schedule")
     return True, "Assignment added to JobHub."
 
 
@@ -866,23 +920,47 @@ def replace_conflicting_assignments(
     """Atomically replace only the clashes the user reviewed on screen."""
     if finish_value <= start_value:
         return False, "Finish time must be after start time."
-    if has_approved_leave(employee_id, work_date):
-        return False, "Staff member is on approved leave."
     expected_ids = {int(value) for value in expected_conflict_ids}
-    current = overlapping_assignment_rows(employee_id, work_date, start_value, finish_value)
-    current_ids = set(current["id"].astype(int).tolist()) if not current.empty else set()
-    if current_ids != expected_ids:
-        return False, "The schedule changed while this clash was open. Review the current bookings again."
-    if not current_ids:
-        return add_assignment(
-            employee_id, job_id, job_stage_id, work_date, start_value, finish_value,
-            planned_hours, site_role, notes, created_by, linked_to_job_dates,
-        )
-
     job_start, day_offset = job_date_linkage(job_id, work_date, linked_to_job_dates)
-    placeholders = ",".join("?" for _ in current_ids)
+    # The re-check of expected_ids against the live conflict set, and the
+    # delete+insert that replaces them, all run inside one locked
+    # transaction (see _serialize_employee_schedule_writes) so a concurrent
+    # write for the same employee cannot slip in between the re-check and
+    # the replace.
     with db_conn() as conn:
         cur = conn.cursor()
+        _serialize_employee_schedule_writes(cur, employee_id)
+        if has_approved_leave(employee_id, work_date, cur=cur):
+            return False, "Staff member is on approved leave."
+        current = overlapping_assignment_rows(employee_id, work_date, start_value, finish_value, cur=cur)
+        current_ids = set(current["id"].astype(int).tolist()) if not current.empty else set()
+        if current_ids != expected_ids:
+            return False, "The schedule changed while this clash was open. Review the current bookings again."
+        if not current_ids:
+            cur.execute(
+                sql_text(
+                    """
+                    INSERT INTO staff_schedule
+                    (job_id,job_stage_id,employee_id,schedule_date,start_time,finish_time,site_role,notes,created_at,
+                     period_type,period_start,period_end,planned_hours,created_by,
+                     linked_to_job_dates,job_day_offset,last_job_start_date)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """
+                ),
+                (
+                    int(job_id), int(job_stage_id) if job_stage_id is not None else None,
+                    int(employee_id), work_date.isoformat(), start_value.strftime("%H:%M"),
+                    finish_value.strftime("%H:%M"), site_role, notes.strip(),
+                    jobhub_now().isoformat(timespec="seconds"), "Day", work_date.isoformat(),
+                    work_date.isoformat(), float(planned_hours), created_by,
+                    1 if linked_to_job_dates and job_start is not None else 0,
+                    day_offset, job_start.isoformat() if job_start else None,
+                ),
+            )
+            notify_db_write()
+            return True, "Assignment added to JobHub."
+
+        placeholders = ",".join("?" for _ in current_ids)
         cur.execute(
             sql_text(f"DELETE FROM staff_schedule WHERE employee_id=? AND id IN ({placeholders})"),
             (int(employee_id), *sorted(current_ids)),
