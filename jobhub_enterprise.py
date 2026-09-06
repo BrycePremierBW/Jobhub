@@ -595,8 +595,8 @@ def enterprise_job_cost_dataframe(ctx: dict[str, Any]) -> pd.DataFrame:
         ctx,
         """
         SELECT m.job_id,
-               COALESCE(SUM(COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, p.price_ex_gst, 0)), 0) AS committed_material_cost,
-               COALESCE(SUM(COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, p.price_ex_gst, 0)), 0) AS received_material_cost
+               COALESCE(SUM(COALESCE(m.qty_required, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS committed_material_cost,
+               COALESCE(SUM(COALESCE(m.qty_received, 0) * COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0)), 0) AS received_material_cost
         FROM material_entries m
         LEFT JOIN products p ON p.id = m.product_id
         GROUP BY m.job_id
@@ -917,7 +917,7 @@ def _material_request_lines(ctx: dict[str, Any], job_id: int, supplier: str = ""
                    ELSE 0
                END AS "Qty",
                COALESCE(m.custom_unit, p.unit, 'Each') AS "Unit",
-               COALESCE(m.custom_unit_price, p.price_ex_gst, 0) AS "Unit Price Ex GST",
+               COALESCE(m.custom_unit_price, m.price_snapshot, p.price_ex_gst, 0) AS "Unit Price Ex GST",
                COALESCE(m.custom_supplier, p.supplier, m.supplier, '') AS supplier
         FROM material_entries m
         LEFT JOIN products p ON p.id = m.product_id
