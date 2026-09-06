@@ -83,8 +83,8 @@ separate PlanReader 3D tool.
 
 | # | Decision | PR | Status |
 |---|----------|----|--------|
-| 8 | Server-side role revalidation before privileged mutations | [#117](https://github.com/BrycePremierBW/Jobhub/pull/117) | In review |
-| 6 | Scheduling TOCTOU double-booking fix | _pending_ | Not started |
+| 8 | Server-side role revalidation before privileged mutations | [#117](https://github.com/BrycePremierBW/Jobhub/pull/117) | Merged, verified |
+| 6 | Scheduling TOCTOU double-booking fix | [#118](https://github.com/BrycePremierBW/Jobhub/pull/118) | In review |
 | 7 | Bulk crew scheduling — transactional/deterministic partial reporting | _pending_ | Not started |
 | 4/5 | Price snapshots on material entries + configurable tax rate | _pending_ | Not started |
 | 1/2/3 | Procurement-authoritative Job Costs reconciliation | _pending_ | Not started |
@@ -132,4 +132,45 @@ a no-op; a role demoted server-side is picked up; a deactivated or deleted
 account fails revalidation. Full suite: 562 tests green. Ruff clean. Smoke
 test renders all 33 routes.
 
-**PR.** [#117](https://github.com/BrycePremierBW/Jobhub/pull/117)
+**PR.** [#117](https://github.com/BrycePremierBW/Jobhub/pull/117) — merged,
+post-merge CI verified green.
+
+### 2026-09-06 — Decision #6: scheduling TOCTOU double-booking race
+
+**Reproduce.** `overlapping_assignment()`/`has_approved_leave()` and the
+subsequent `INSERT` ran as separate, unlocked statements/connections.
+Wrote `tests/test_scheduler_toctou_double_booking.py`: two real threads,
+each with its own SQLite connection to the same on-disk file, race to book
+the same employee for the same overlapping slot via a `threading.Barrier`.
+Run 5 times against pre-fix code: **5/5 times both threads succeeded**,
+producing two overlapping rows for the same employee — a rock-solid,
+reliably reproducible double-booking, not a theoretical race.
+
+**Fix.** Added `_serialize_employee_schedule_writes(cur, employee_id)`,
+called first inside the same transaction that performs the leave/overlap
+check and the insert:
+- Postgres: `pg_advisory_xact_lock(employee_id)` — a transaction-scoped
+  advisory lock keyed on the employee id, blocking a concurrent transaction
+  doing the same for the same employee even when neither has an existing
+  row yet to lock via `SELECT ... FOR UPDATE`. Released automatically on
+  commit/rollback.
+- SQLite: `BEGIN IMMEDIATE` forces an immediate write-intent lock before
+  the read-check (the default deferred transaction only locks at the first
+  write), so a concurrent connection attempting the same blocks until this
+  transaction commits. Coarser than Postgres's per-employee lock, but
+  SQLite here only backs local/CI runs, never concurrent production
+  traffic.
+
+`has_approved_leave()` and `overlapping_assignment_rows()`/
+`overlapping_assignment()` gained an optional `cur` parameter so
+`add_assignment()` and `replace_conflicting_assignments()` run their checks
+against the same locked cursor instead of opening a second, unlocked
+connection. Existing callers that don't pass `cur` are unaffected —
+purely additive.
+
+**Tests.** `tests/test_scheduler_toctou_double_booking.py` — exactly one of
+the two racing bookings succeeds, the other is correctly rejected as an
+overlap, and the database has exactly one row. Full suite: 562 tests
+green. Ruff clean. Smoke test renders all 33 routes.
+
+**PR.** [#118](https://github.com/BrycePremierBW/Jobhub/pull/118)
