@@ -23344,6 +23344,69 @@ def jobhub_enterprise_context():
     }
 
 
+# Phase 3 of docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md (architecture
+# decision #9): every business-data table that should eventually be scoped
+# to an organisation. Confirmed to exist somewhere in the live app as of
+# this writing -- spread across pb_jobhub_app.py, jobhub_enterprise.py,
+# pb_jobhub_visual_scheduler.py and jobhub/planreader_bridge.py, which is
+# exactly why this runs last, after every one of those modules' own
+# schema-ensure calls. A handful of tables owned by guard modules that only
+# create their schema the first time their own page is opened (e.g.
+# jobhub_crews, job_swms) may not exist yet on a given startup; those are
+# silently skipped and picked up automatically on a later startup once they
+# do exist -- this function is not schema_migrations-gated and runs on
+# every startup for exactly that reason. Deliberately not exhaustive: see
+# docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md section 3 for the
+# starting inventory this list is drawn from, and its own caveat that new
+# tables may need adding here as they're found.
+_ORGANIZATION_SCOPED_BUSINESS_TABLES = (
+    "jobs", "builders_clients", "employees", "products",
+    "estimate_working_sheets", "estimate_line_items", "estimate_baselines",
+    "estimate_baseline_lines", "estimating_rates", "estimate_rate_register",
+    "purchase_orders", "purchase_order_lines", "supplier_invoices",
+    "supplier_invoice_lines", "material_entries", "material_order_requests",
+    "material_order_items",
+    "staff_schedule", "staff_requests", "timesheet_entries", "wage_entries",
+    "field_clock_entries", "jobhub_crews", "jobhub_crew_members",
+    "job_budgets", "job_stages", "job_variations", "invoice_claims",
+    "invoice_claim_items", "job_documents", "job_document_blobs",
+    "job_photos", "job_comments", "job_swms", "job_swms_signatures",
+    "job_progress_snapshots", "job_extra_daysheets",
+    "job_extra_daysheet_items", "job_colour_schedules",
+)
+
+
+def ensure_business_data_organization_id_columns():
+    from jobhub.organization_schema_guard import get_organization_id, DEFAULT_ORGANIZATION_SLUG
+    default_org_id = get_organization_id(DEFAULT_ORGANIZATION_SLUG)
+    if default_org_id is None:
+        return
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        for table in _ORGANIZATION_SCOPED_BUSINESS_TABLES:
+            try:
+                _migration_ensure_column(cur, table, "organization_id", "INTEGER")
+                cur.execute(
+                    f"UPDATE {table} SET organization_id = ? WHERE organization_id IS NULL",
+                    (default_org_id,),
+                )
+                # Commit per table so a later table's failure (e.g. it
+                # doesn't exist yet on this startup) can only roll back its
+                # own partial work, never an earlier table's already-applied
+                # column/backfill in this same loop.
+                conn.commit()
+            except Exception:
+                # Table doesn't exist yet on this startup (a guard module
+                # whose own lazy schema-ensure hasn't run because that
+                # feature has never been opened) -- picked up automatically
+                # once it does exist, since this isn't a one-time migration.
+                conn.rollback()
+                continue
+    finally:
+        conn.close()
+
+
 # =============================
 # START APP
 # =============================
@@ -23381,6 +23444,13 @@ def initialise_jobhub_runtime(database_url, data_dir):
         except Exception:
             # A failed PlanReader bridge must never block JobHub startup.
             pass
+    # Phase 3 of docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md
+    # (architecture decision #9): tag business-data tables. Runs last, after
+    # every other schema-ensure call above, so tables created by any of them
+    # (jobhub_enterprise, pb_jobhub_visual_scheduler, PlanReader, ...)
+    # already exist. Purely additive -- nullable column + backfill, no query
+    # anywhere reads organization_id from these tables yet.
+    ensure_business_data_organization_id_columns()
     push_status = current_phone_push_provider_status()
     print(
         "JobHub OneSignal provider check: "
