@@ -15586,7 +15586,13 @@ def estimate_working_sheet_page():
                 else:
                     pb_error("No line items to update.")
             st.metric("Line Item Total", f"${float(edited['Line Total'].fillna(0).sum()):,.2f}")
-            delete_options = {f"{r['Section']} - {r['Description']} - ${float(r['Line Total'] or 0):,.2f}": int(r["id"]) for _, r in lines_df.iterrows()}
+            # Label includes the ID so two line items with identical
+            # section/description/total (routine for repeated rooms or
+            # duplicated takeoff-import rows) can't collide into one option.
+            delete_options = {
+                f"{r['Section']} - {r['Description']} - ${float(r['Line Total'] or 0):,.2f} (ID {int(r['id'])})": int(r["id"])
+                for _, r in lines_df.iterrows()
+            }
             selected_delete = st.selectbox("Line item to delete", list(delete_options.keys()))
             confirm = st.checkbox("Confirm delete selected line item")
             if st.button("Delete Selected Line Item"):
@@ -24183,7 +24189,12 @@ elif menu == "Builders & Clients":
         if builders_df.empty:
             st.info("No builders or clients yet.")
         else:
-            builder_map = {row["name"]: int(row["id"]) for _, row in builders_df.iterrows()}
+            # Label includes the ID so two builders/clients sharing the same
+            # name can't collide into one option and get the wrong one edited.
+            builder_map = {
+                f"{row['name']} (ID {int(row['id'])})": int(row["id"])
+                for _, row in builders_df.iterrows()
+            }
             selected_builder = st.selectbox("Select Builder / Client to Edit", list(builder_map.keys()))
             selected_id = builder_map[selected_builder]
             current = builders_df[builders_df["id"] == selected_id].iloc[0]
@@ -24225,7 +24236,13 @@ elif menu == "Builders & Clients":
         if builders_df.empty:
             st.info("No builders or clients yet.")
         else:
-            builder_map = {row["name"]: int(row["id"]) for _, row in builders_df.iterrows()}
+            # Label includes the ID so two builders/clients sharing the same
+            # name (the exact case the Merge Duplicate Contacts tab below
+            # exists to clean up) can't collide into one unselectable option.
+            builder_map = {
+                f"{row['name']} (ID {int(row['id'])})": int(row["id"])
+                for _, row in builders_df.iterrows()
+            }
             selected_builder = st.selectbox("Select Builder / Client to Remove", list(builder_map.keys()), key="remove_builder_select")
             selected_id = builder_map[selected_builder]
 
@@ -25795,15 +25812,22 @@ elif menu == "Equipment":
             st.dataframe(all_df.drop(columns=["Record ID"]), width="stretch", hide_index=True)
 
             with st.expander("Delete Saved Equipment Line"):
+                # Label includes the ID so two lines for the same job/item
+                # (e.g. the same equipment taken out more than once) can't
+                # collide into one unselectable option.
                 delete_map = {
-                    f"{row['Job No']} - {row['Equipment Item']}": int(row["Record ID"])
+                    f"{row['Job No']} - {row['Equipment Item']} (ID {int(row['Record ID'])})": int(row["Record ID"])
                     for _, row in all_df.iterrows()
                 }
                 selected = st.selectbox("Select line to delete", list(delete_map.keys()))
+                confirm_equipment_delete = st.checkbox("Confirm delete selected equipment line")
                 if st.button("Delete Selected Equipment Line"):
-                    execute("DELETE FROM equipment_checklist_records WHERE id = ?", (delete_map[selected],))
-                    pb_success("Equipment line deleted.")
-                    refresh()
+                    if not confirm_equipment_delete:
+                        pb_error("Tick the confirm box first.")
+                    else:
+                        execute("DELETE FROM equipment_checklist_records WHERE id = ?", (delete_map[selected],))
+                        pb_success("Equipment line deleted.")
+                        refresh()
 
     with tab_items:
         st.subheader("Manage Checklist Items")
