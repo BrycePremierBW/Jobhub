@@ -6632,6 +6632,44 @@ def _delete_user_auth_token(token: str) -> None:
         pass
 
 
+def _revalidate_session_user(user: dict) -> dict | None:
+    """Re-check active/role/must_change_password against app_users.
+
+    st.session_state["user"] is set once at login (or once per browser
+    session on an auth-token restore) and was otherwise trusted indefinitely
+    for the rest of that Streamlit session -- an admin deactivating or
+    demoting a currently-logged-in user had no effect until that user's own
+    session happened to end. Streamlit reruns the whole script on almost
+    every interaction, so re-checking here (one indexed primary-key lookup)
+    makes a role/active change take effect on the user's very next action,
+    everywhere in the app, without needing a separate check at every
+    individual privileged mutation call site -- the same class of gap
+    already found and fixed for the Setup/Subscriber/Xero panels, where some
+    individual call sites had a check and others didn't.
+    """
+    try:
+        user_id = int(user.get("id"))
+    except (TypeError, ValueError):
+        return None
+    try:
+        live_df = df_query(
+            "SELECT role, active, COALESCE(must_change_password, 0) AS must_change_password "
+            "FROM app_users WHERE id = ?",
+            (user_id,),
+        )
+    except Exception:
+        # A transient DB error must not lock out every active user on every
+        # rerun; keep the session's last-known state for this run and let
+        # the next rerun try again.
+        return user
+    if live_df.empty or int(live_df.iloc[0]["active"] or 0) != 1:
+        return None
+    live = live_df.iloc[0]
+    user["role"] = str(live["role"])
+    user["must_change_password"] = bool(int(live["must_change_password"] or 0))
+    return user
+
+
 def require_login():
     if "user" not in st.session_state:
         st.session_state["user"] = None
@@ -6649,6 +6687,15 @@ def require_login():
                 st.session_state["_pb_auth_token"] = str(token)
 
     if st.session_state["user"]:
+        revalidated = _revalidate_session_user(st.session_state["user"])
+        if revalidated is None:
+            st.session_state["user"] = None
+            token = st.session_state.pop("_pb_auth_token", None)
+            if token:
+                _delete_user_auth_token(str(token))
+            pb_error("This account is no longer active. Contact an administrator.")
+            st.stop()
+        st.session_state["user"] = revalidated
         if st.session_state["user"].get("must_change_password"):
             force_password_change()
             st.stop()
