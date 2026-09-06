@@ -17,15 +17,13 @@ from typing import Any, Iterable
 
 
 _TRACKED_TAB_SETS = (
+    # Job Register no longer uses st.tabs() -- it was converted to a lazy
+    # st.radio(key="job_register_section") selector (jobhub-audit-2026-09,
+    # JH-PERF-JOBS-001), which persists its own selection across reruns
+    # natively and so needs no entry here.
     frozenset({
-        "Add Job",
-        "Edit Job",
-        "Remove / Archive",
-        "Archived Jobs",
-        "Search by Builder",
-        "Job Register",
-    }),
-    frozenset({
+        "Add Timesheet",
+        "Review Timesheets",
         "Add Timesheet",
         "Review Timesheets",
         "Timesheets by Job",
