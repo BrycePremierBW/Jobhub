@@ -99,6 +99,7 @@ separate PlanReader 3D tool.
 | 1/2/3 | Procurement reconciliation for `enterprise_job_cost_dataframe()` | [#133](https://github.com/BrycePremierBW/Jobhub/pull/133) | Merged, verified |
 | 9 | Multi-tenant Phase 1: bootstrap org schema at core startup | [#134](https://github.com/BrycePremierBW/Jobhub/pull/134) | Merged, verified |
 | 9 | Multi-tenant Phase 2: `organization_id` on `app_users` | [#136](https://github.com/BrycePremierBW/Jobhub/pull/136) | Merged, verified |
+| 9 | Multi-tenant Phase 3: `organization_id` on 39 business-data tables | [#138](https://github.com/BrycePremierBW/Jobhub/pull/138) | Merged, verified |
 | 11 | Palm Lakes migration | **BLOCKED — do not touch** | N/A |
 
 **Note on PR #99.** While checking for other open PRs, found
@@ -129,15 +130,22 @@ user's own PR to close or keep; flagged here rather than acted on.
   git "fix" history specifically and found only those; it did not rule
   out other value in the remaining ~17 files (see
   `docs/DEAD_CODE_INVENTORY_DECISION_10.md` section 5).
-- Decision #9's design is written; Phase 1 (tenant-metadata bootstrap at
-  core startup, #134) and Phase 2 (`organization_id` identity scoping on
-  `app_users`, #136) are now live. Phase 3 onward (additive, nullable,
-  backfilled `organization_id` on the ~25 business-data tables inventoried
-  in the design doc, then per-table enforcement via a scoped-query
-  chokepoint plus a CI coverage test, then the actual onboarding flow) has
-  not been started -- see `docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md`
-  for the full phased plan. Do not create a second `organizations` row in
-  production before Phase 4 (enforcement) is complete for every table
+- Decision #9's design is written; Phases 1-3 (tenant-metadata bootstrap
+  at core startup, #134; `organization_id` identity scoping on
+  `app_users`, #136; additive/backfilled `organization_id` on 39
+  business-data tables, #138) are now live. **Per the design doc's own
+  rule, Phase 4 (enforcement) should not begin until Phase 3 has been
+  running in this codebase's actual production deployment without
+  incident** -- that's outside what this autonomous session can verify
+  (no visibility into the live Render deployment), so Phase 4 is
+  deliberately paused here pending the user's own production
+  confirmation, not merely "not yet gotten to." Phase 4 itself (a scoped-
+  query chokepoint plus a CI coverage test per table, replacing the ~1000+
+  manual call-site edits a naive approach would need) and Phase 5 (the
+  actual onboarding flow) remain fully undesigned-in-code -- see
+  `docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md` for the full phased
+  plan. Do not create a second `organizations` row in production before
+  Phase 4 (enforcement) is complete for every table
   that needs it.
 
 ---
@@ -759,3 +767,49 @@ clean. Smoke test renders all 33 routes.
 merged, post-merge CI verified green. Phases 1-2 of
 `docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md` complete; Phases 3-5
 not started.
+
+### 2026-09-06 — Decision #9 Phase 3: tag business-data tables
+
+**Design/verify.** Added `_ORGANIZATION_SCOPED_BUSINESS_TABLES` (39
+tables, drawn from the design doc's own section-3 inventory) and
+`ensure_business_data_organization_id_columns()`, called last in
+`initialise_jobhub_runtime()` -- after every other schema-ensure call, so
+tables owned by `jobhub_enterprise.py`, `pb_jobhub_visual_scheduler.py`
+and the PlanReader bridge all already exist. Manually verified each of
+the 39 names against the live codebase first (grepping every
+`CREATE TABLE IF NOT EXISTS` across all files, not just
+`pb_jobhub_app.py`) rather than trusting the design doc's own inventory
+blindly, per its own caveat that some names could be stale. All 39 were
+confirmed genuinely real tables (none phantom/renamed).
+
+**Fix.** Deliberately **not** a one-time `schema_migrations`-gated
+migration like Phase 2's, because several listed tables (`jobhub_crews`,
+`job_swms`, `material_order_requests`, ...) are only created lazily by
+their own guard module the first time that feature's page is opened --
+they may not exist yet on a given startup. Runs on every startup instead
+so any such table is picked up automatically once it exists, and any row
+a normal INSERT missed (every INSERT in this codebase still omits
+`organization_id` today -- no query sets it yet) keeps getting
+backfilled. Each table is committed individually so one table not
+existing yet can never roll back an earlier table's already-applied
+column/backfill in the same pass. Verified against a fresh database:
+35-36 of 39 tables get `organization_id` at first startup; the remaining
+handful (confirmed lazy-guard-owned) are silently skipped and picked up
+on a later startup, exactly as designed.
+
+**Tests.** `tests/run_business_data_organization_id_check.py`
+(fresh-process script, not pytest-collected) -- confirms the large
+majority of listed tables get `organization_id` on a fresh startup, and
+that a freshly inserted row keeps getting backfilled on a later run.
+Confirmed it fails against pre-fix code
+(`AttributeError: no _ORGANIZATION_SCOPED_BUSINESS_TABLES`). Full suite:
+722 tests green (unaffected -- purely additive, no query changed). Ruff
+clean. Smoke test renders all 33 routes.
+
+**PR.** [#138](https://github.com/BrycePremierBW/Jobhub/pull/138) —
+merged, post-merge CI verified green. Phases 1-3 of
+`docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md` complete. **Phase 4
+(enforcement) explicitly paused** pending the user's own confirmation
+that Phase 3 has run in the real production deployment without
+incident, per the design doc's own sequencing rule -- this is outside
+what an autonomous coding session can verify.
