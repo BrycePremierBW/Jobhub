@@ -23307,6 +23307,13 @@ def initialise_jobhub_runtime(database_url, data_dir):
     init_db()
     apply_schema_migrations()
     backfill_job_document_file_data()
+    # Tenant-metadata foundation for eventual multi-tenant organisation
+    # scoping (architecture decision #9). Previously this only ran lazily
+    # the first time someone opened Xero setup, so the organizations table
+    # and its default "premier-brushworks" row were not guaranteed to exist
+    # otherwise. Phase 1 of docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md.
+    from jobhub.organization_schema_guard import ensure_organization_schema
+    ensure_organization_schema()
     ensure_enterprise_schema(connect)
     ensure_v2_schema(connect)
     ensure_v4_schema(connect)
