@@ -13173,7 +13173,7 @@ def attach_intake_package_to_job(
                     (
                         max(qty, current["qty"]),
                         max(hours, current["hours"]),
-                        current["allowance"] + allowance,
+                        max(allowance, current["allowance"]),
                         _takeoff_text(row.get("Notes")),
                         current["id"],
                     ),
@@ -13289,9 +13289,14 @@ def attach_intake_package_to_job(
                 )
                 existing_material = cur.fetchone()
                 if merge and existing_material:
+                    # material_entries has no updated_at column (never added
+                    # by any ensure_column migration) -- this update crashed
+                    # with "no such column: updated_at" every time a merge
+                    # matched an existing material row, failing the whole
+                    # import (caught by the caller's generic except Exception).
                     cur.execute(
-                        "UPDATE material_entries SET qty_required = qty_required + ?, updated_at = ? WHERE id = ?",
-                        (row["qty"], now, int(existing_material[0])),
+                        "UPDATE material_entries SET qty_required = qty_required + ? WHERE id = ?",
+                        (row["qty"], int(existing_material[0])),
                     )
                     merged_material_count += 1
                     continue
