@@ -2052,46 +2052,59 @@ def page_schedule(user: dict) -> None:
             if st.button("Copy first week to next week", width="stretch"):
                 source = assignment_rows(start, start + timedelta(days=6))
                 added = skipped = 0
+                errored: list[str] = []
                 copy_clashes: list[dict] = []
                 for _, row in source.iterrows():
-                    copy_date = to_date(row["schedule_date"]) + timedelta(days=7)
-                    copy_start = time_value(row["start_time"])
-                    copy_finish = time_value(row["finish_time"], time(15, 0))
-                    conflicts = overlapping_assignment_rows(
-                        int(row["employee_id"]), copy_date, copy_start, copy_finish,
+                    # Wrap each row so one unexpected failure (a dropped DB
+                    # connection, a lock timeout) can't crash the whole batch
+                    # before the added/skipped summary below is shown --
+                    # the loop always finishes and always reports accurately.
+                    try:
+                        copy_date = to_date(row["schedule_date"]) + timedelta(days=7)
+                        copy_start = time_value(row["start_time"])
+                        copy_finish = time_value(row["finish_time"], time(15, 0))
+                        conflicts = overlapping_assignment_rows(
+                            int(row["employee_id"]), copy_date, copy_start, copy_finish,
+                        )
+                        if not conflicts.empty:
+                            copy_clashes.append({
+                                "employee_id": int(row["employee_id"]),
+                                "staff_name": str(row["staff"]),
+                                "expected_conflict_ids": conflicts["id"].astype(int).tolist(),
+                                "job_id": int(row["job_id"]),
+                                "job_stage_id": int(row["job_stage_id"]) if pd.notna(row["job_stage_id"]) else None,
+                                "job_label": f"{row['job_no']} · {row['job_name']} — {row['stage_name']}",
+                                "work_date": copy_date.isoformat(),
+                                "start_time": copy_start.strftime("%H:%M"),
+                                "finish_time": copy_finish.strftime("%H:%M"),
+                                "planned_hours": float(row["hours"]),
+                                "site_role": str(row["site_role"]),
+                                "notes": str(row["notes"] or ""),
+                                "created_by": str(user.get("username", "")),
+                                "linked_to_job_dates": True,
+                            })
+                            continue
+                        ok, _ = add_assignment(
+                            int(row["employee_id"]),
+                            int(row["job_id"]),
+                            int(row["job_stage_id"]) if pd.notna(row["job_stage_id"]) else None,
+                            to_date(row["schedule_date"]) + timedelta(days=7),
+                            time_value(row["start_time"]),
+                            time_value(row["finish_time"], time(15, 0)),
+                            float(row["hours"]),
+                            str(row["site_role"]),
+                            str(row["notes"] or ""),
+                            str(user.get("username", "")),
+                        )
+                        added += int(ok)
+                        skipped += int(not ok)
+                    except Exception as exc:
+                        errored.append(f"{row['staff']} {to_date(row['schedule_date']).strftime('%d %b')}: {exc}")
+                if errored:
+                    st.warning(
+                        f"{len(errored)} entr{'y' if len(errored) == 1 else 'ies'} could not be checked/copied "
+                        "due to an unexpected error:\n\n" + "\n\n".join(f"• {item}" for item in errored[:15])
                     )
-                    if not conflicts.empty:
-                        copy_clashes.append({
-                            "employee_id": int(row["employee_id"]),
-                            "staff_name": str(row["staff"]),
-                            "expected_conflict_ids": conflicts["id"].astype(int).tolist(),
-                            "job_id": int(row["job_id"]),
-                            "job_stage_id": int(row["job_stage_id"]) if pd.notna(row["job_stage_id"]) else None,
-                            "job_label": f"{row['job_no']} · {row['job_name']} — {row['stage_name']}",
-                            "work_date": copy_date.isoformat(),
-                            "start_time": copy_start.strftime("%H:%M"),
-                            "finish_time": copy_finish.strftime("%H:%M"),
-                            "planned_hours": float(row["hours"]),
-                            "site_role": str(row["site_role"]),
-                            "notes": str(row["notes"] or ""),
-                            "created_by": str(user.get("username", "")),
-                            "linked_to_job_dates": True,
-                        })
-                        continue
-                    ok, _ = add_assignment(
-                        int(row["employee_id"]),
-                        int(row["job_id"]),
-                        int(row["job_stage_id"]) if pd.notna(row["job_stage_id"]) else None,
-                        to_date(row["schedule_date"]) + timedelta(days=7),
-                        time_value(row["start_time"]),
-                        time_value(row["finish_time"], time(15, 0)),
-                        float(row["hours"]),
-                        str(row["site_role"]),
-                        str(row["notes"] or ""),
-                        str(user.get("username", "")),
-                    )
-                    added += int(ok)
-                    skipped += int(not ok)
                 if copy_clashes:
                     st.session_state[copy_pending_key] = copy_clashes
                     st.session_state["scheduler_clash_result"] = {
@@ -2229,45 +2242,53 @@ def page_schedule(user: dict) -> None:
                     if work_day.weekday() not in selected_day_numbers:
                         continue
                     for staff_name in crew:
-                        employee_id = int(staff.loc[staff["name"] == staff_name, "id"].iloc[0])
-                        conflicts = overlapping_assignment_rows(
-                            employee_id, work_day, start_time, finish_time,
-                        )
-                        if not conflicts.empty:
-                            clash_items.append({
-                                "employee_id": employee_id,
-                                "staff_name": staff_name,
-                                "expected_conflict_ids": conflicts["id"].astype(int).tolist(),
-                                "job_id": job_id,
-                                "job_stage_id": job_stage_id,
-                                "job_label": job_label,
-                                "work_date": work_day.isoformat(),
-                                "start_time": start_time.strftime("%H:%M"),
-                                "finish_time": finish_time.strftime("%H:%M"),
-                                "planned_hours": float(hours),
-                                "site_role": site_role,
-                                "notes": notes,
-                                "created_by": str(user.get("username", "")),
-                                "linked_to_job_dates": bool(linked_dates),
-                            })
-                            continue
-                        ok, message = add_assignment(
-                            employee_id,
-                            job_id,
-                            job_stage_id,
-                            work_day,
-                            start_time,
-                            finish_time,
-                            hours,
-                            site_role,
-                            notes,
-                            str(user.get("username", "")),
-                            linked_dates,
-                        )
-                        if ok:
-                            added += 1
-                        else:
-                            skipped.append(f"{staff_name} {work_day.strftime('%d %b')}: {message}")
+                        # Wrap each employee/day so one unexpected failure
+                        # (a dropped DB connection, a lock timeout) can't
+                        # crash the whole batch before the added/skipped
+                        # summary below is shown -- the loop always finishes
+                        # and always reports accurately.
+                        try:
+                            employee_id = int(staff.loc[staff["name"] == staff_name, "id"].iloc[0])
+                            conflicts = overlapping_assignment_rows(
+                                employee_id, work_day, start_time, finish_time,
+                            )
+                            if not conflicts.empty:
+                                clash_items.append({
+                                    "employee_id": employee_id,
+                                    "staff_name": staff_name,
+                                    "expected_conflict_ids": conflicts["id"].astype(int).tolist(),
+                                    "job_id": job_id,
+                                    "job_stage_id": job_stage_id,
+                                    "job_label": job_label,
+                                    "work_date": work_day.isoformat(),
+                                    "start_time": start_time.strftime("%H:%M"),
+                                    "finish_time": finish_time.strftime("%H:%M"),
+                                    "planned_hours": float(hours),
+                                    "site_role": site_role,
+                                    "notes": notes,
+                                    "created_by": str(user.get("username", "")),
+                                    "linked_to_job_dates": bool(linked_dates),
+                                })
+                                continue
+                            ok, message = add_assignment(
+                                employee_id,
+                                job_id,
+                                job_stage_id,
+                                work_day,
+                                start_time,
+                                finish_time,
+                                hours,
+                                site_role,
+                                notes,
+                                str(user.get("username", "")),
+                                linked_dates,
+                            )
+                            if ok:
+                                added += 1
+                            else:
+                                skipped.append(f"{staff_name} {work_day.strftime('%d %b')}: {message}")
+                        except Exception as exc:
+                            skipped.append(f"{staff_name} {work_day.strftime('%d %b')}: unexpected error: {exc}")
                 if clash_items:
                     st.session_state[bulk_pending_key] = clash_items
                     st.session_state["scheduler_clash_result"] = {
@@ -2714,36 +2735,50 @@ def page_crew_suggestions(user: dict) -> None:
             pb_error("Select at least one crew member.")
             return
         added = skipped = 0
+        errored: list[str] = []
         suggestion_clashes: list[dict] = []
         for work_day in daterange(to_date(schedule_start), to_date(schedule_end)):
             if work_day.weekday() >= 5:
                 continue
             for name in crew:
-                employee_id = int(staff.loc[staff["name"] == name, "id"].iloc[0])
-                conflicts = overlapping_assignment_rows(
-                    employee_id, work_day, time(7, 0), time(15, 0),
-                )
-                if not conflicts.empty:
-                    job_record = jobs[jobs["id"].astype(int) == int(job_id)].iloc[0]
-                    suggestion_clashes.append({
-                        "employee_id": employee_id, "staff_name": name,
-                        "expected_conflict_ids": conflicts["id"].astype(int).tolist(),
-                        "job_id": job_id, "job_stage_id": None,
-                        "job_label": f"{job_record['job_no']} · {job_record['job_name']} — Whole Job",
-                        "work_date": work_day.isoformat(), "start_time": "07:00",
-                        "finish_time": "15:00", "planned_hours": float(hours),
-                        "site_role": "Site Work", "notes": "JobHub approved crew suggestion",
-                        "created_by": str(user.get("username", "")),
-                        "linked_to_job_dates": True,
-                    })
-                    continue
-                ok, _ = add_assignment(
-                    employee_id, job_id, None, work_day, time(7, 0), time(15, 0),
-                    float(hours), "Site Work", "JobHub approved crew suggestion",
-                    str(user.get("username", "")), True,
-                )
-                added += int(ok)
-                skipped += int(not ok)
+                # Wrap each employee/day so one unexpected failure (a
+                # dropped DB connection, a lock timeout) can't crash the
+                # whole batch before the added/skipped summary below is
+                # shown -- the loop always finishes and always reports
+                # accurately.
+                try:
+                    employee_id = int(staff.loc[staff["name"] == name, "id"].iloc[0])
+                    conflicts = overlapping_assignment_rows(
+                        employee_id, work_day, time(7, 0), time(15, 0),
+                    )
+                    if not conflicts.empty:
+                        job_record = jobs[jobs["id"].astype(int) == int(job_id)].iloc[0]
+                        suggestion_clashes.append({
+                            "employee_id": employee_id, "staff_name": name,
+                            "expected_conflict_ids": conflicts["id"].astype(int).tolist(),
+                            "job_id": job_id, "job_stage_id": None,
+                            "job_label": f"{job_record['job_no']} · {job_record['job_name']} — Whole Job",
+                            "work_date": work_day.isoformat(), "start_time": "07:00",
+                            "finish_time": "15:00", "planned_hours": float(hours),
+                            "site_role": "Site Work", "notes": "JobHub approved crew suggestion",
+                            "created_by": str(user.get("username", "")),
+                            "linked_to_job_dates": True,
+                        })
+                        continue
+                    ok, _ = add_assignment(
+                        employee_id, job_id, None, work_day, time(7, 0), time(15, 0),
+                        float(hours), "Site Work", "JobHub approved crew suggestion",
+                        str(user.get("username", "")), True,
+                    )
+                    added += int(ok)
+                    skipped += int(not ok)
+                except Exception as exc:
+                    errored.append(f"{name} {work_day.strftime('%d %b')}: {exc}")
+        if errored:
+            st.warning(
+                f"{len(errored)} entr{'y' if len(errored) == 1 else 'ies'} could not be checked/added "
+                "due to an unexpected error:\n\n" + "\n\n".join(f"• {item}" for item in errored[:15])
+            )
         if suggestion_clashes:
             st.session_state[suggestion_pending_key] = suggestion_clashes
             st.session_state["scheduler_clash_result"] = {

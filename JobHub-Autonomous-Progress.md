@@ -85,7 +85,7 @@ separate PlanReader 3D tool.
 |---|----------|----|--------|
 | 8 | Server-side role revalidation before privileged mutations | [#117](https://github.com/BrycePremierBW/Jobhub/pull/117) | Merged, verified |
 | 6 | Scheduling TOCTOU double-booking fix | [#118](https://github.com/BrycePremierBW/Jobhub/pull/118) | In review |
-| 7 | Bulk crew scheduling — transactional/deterministic partial reporting | _pending_ | Not started |
+| 7 | Bulk crew scheduling — transactional/deterministic partial reporting | [#119](https://github.com/BrycePremierBW/Jobhub/pull/119) | In review |
 | 4/5 | Price snapshots on material entries + configurable tax rate | _pending_ | Not started |
 | 1/2/3 | Procurement-authoritative Job Costs reconciliation | _pending_ | Not started |
 | 10 | Dead `jobhub/pages` code: inventory → port → test → remove | _pending_ | Not started |
@@ -173,4 +173,39 @@ the two racing bookings succeeds, the other is correctly rejected as an
 overlap, and the database has exactly one row. Full suite: 562 tests
 green. Ruff clean. Smoke test renders all 33 routes.
 
-**PR.** [#118](https://github.com/BrycePremierBW/Jobhub/pull/118)
+**PR.** [#118](https://github.com/BrycePremierBW/Jobhub/pull/118) — merged,
+post-merge CI verified green.
+
+### 2026-09-06 — Decision #7: bulk crew scheduling reliability
+
+**Reproduce.** "Allocate crew", "Approve and add suggested crew" and "Copy
+first week to next week" each loop over every employee/day combination
+calling `add_assignment()` with no per-item exception handling. Wrote
+`tests/test_bulk_crew_scheduling_partial_failure.py`, extracting the real
+"Allocate crew" per-item loop body and feeding it a fake `add_assignment`
+that raises for one employee. Confirmed it fails against pre-fix code with
+the raw `ConnectionError` propagating straight out of the loop — i.e. a
+single unexpected failure partway through a ~14-person batch would crash
+the handler with an unhandled traceback before the added/skipped summary
+was ever shown, leaving no way to tell which earlier iterations had
+already committed.
+
+**Fix.** Wrapped each employee/day iteration in all three loops in a
+try/except that folds an unexpected exception into the same deterministic
+added/skipped/errored accounting every caller already had for expected
+outcomes (leave conflicts, overlaps) — the loop always finishes and the
+user always sees the true, complete picture of what happened in that
+batch. Chose "explicitly partial with deterministic reporting" over a
+single all-or-nothing transaction deliberately: a hard rollback would also
+discard crew members who succeeded just because one other member had an
+unrelated leave conflict — worse UX for a batch that legitimately expects
+some skips.
+
+**Tests.** `tests/test_bulk_crew_scheduling_partial_failure.py` — the
+failure is folded into the report and unaffected iterations still succeed
+normally; a no-failure run still reports everyone added with nothing
+skipped (no regression on the happy path). Full suite: 565 tests green
+(rebased cleanly onto #118's TOCTOU fix in the same file). Ruff clean.
+Smoke test renders all 33 routes.
+
+**PR.** [#119](https://github.com/BrycePremierBW/Jobhub/pull/119)
