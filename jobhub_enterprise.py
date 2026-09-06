@@ -874,6 +874,12 @@ def _material_request_lines(ctx: dict[str, Any], job_id: int, supplier: str = ""
         LEFT JOIN products p ON p.id = m.product_id
         WHERE m.job_id = ?
           AND COALESCE(m.qty_required, 0) > COALESCE(m.qty_received, 0)
+          AND NOT EXISTS (
+              SELECT 1 FROM purchase_order_lines pol
+              JOIN purchase_orders po ON po.id = pol.purchase_order_id
+              WHERE pol.material_entry_id = m.id
+                AND po.status NOT IN ('Cancelled', 'Rejected')
+          )
           {supplier_clause}
         ORDER BY m.id
         """,
