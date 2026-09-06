@@ -25904,11 +25904,25 @@ elif menu == "Equipment":
                 SELECT *
                 FROM equipment_checklist_records
                 WHERE job_id = ?
+                ORDER BY id ASC
             """, (selected_job_id,))
 
+            # existing_ids_by_item lets the save handler below reuse this one
+            # query instead of re-running "SELECT id FROM
+            # equipment_checklist_records WHERE job_id = ? AND
+            # checklist_item_id = ?" once per checklist item on every save --
+            # a real N+1 read pattern for a checklist that can easily have
+            # dozens of items (jobhub-audit-2026-09, JH-PERF-JOBS-001
+            # follow-up). ORDER BY id ASC above keeps this equivalent to the
+            # old per-row query's own ordering, so the "keep the lowest id,
+            # delete the rest" duplicate-cleanup logic below sees the same
+            # ids in the same order it always did.
             existing_by_item = {}
+            existing_ids_by_item: dict[int, list[int]] = {}
             if not existing_df.empty:
                 existing_by_item = {int(row["checklist_item_id"]): row for _, row in existing_df.iterrows()}
+                for _, row in existing_df.iterrows():
+                    existing_ids_by_item.setdefault(int(row["checklist_item_id"]), []).append(int(row["id"]))
 
             st.caption("This checklist saves directly against the selected job. The Job Equipment Master List totals everything for that same job.")
 
@@ -25978,14 +25992,10 @@ elif menu == "Equipment":
                             or row["qty_returned"] > 0
                         )
 
-                        existing = df_query("""
-                            SELECT id FROM equipment_checklist_records
-                            WHERE job_id = ? AND checklist_item_id = ?
-                            ORDER BY id ASC
-                        """, (row["job_id"], row["item_id"]))
+                        existing_ids = existing_ids_by_item.get(row["item_id"], [])
 
                         if should_save:
-                            if existing.empty:
+                            if not existing_ids:
                                 execute("""
                                     INSERT INTO equipment_checklist_records
                                     (job_id, checklist_item_id, qty_required, qty_taken, qty_returned,
@@ -25998,7 +26008,7 @@ elif menu == "Equipment":
                                     condition_out, condition_in, notes
                                 ))
                             else:
-                                keep_id = int(existing.iloc[0]["id"])
+                                keep_id = existing_ids[0]
                                 execute("""
                                     UPDATE equipment_checklist_records
                                     SET qty_required = ?, qty_taken = ?, qty_returned = ?,
@@ -26014,12 +26024,11 @@ elif menu == "Equipment":
                                 ))
 
                                 # Remove duplicates if an older database allowed them
-                                for dup_id in list(existing["id"])[1:]:
-                                    execute("DELETE FROM equipment_checklist_records WHERE id = ?", (int(dup_id),))
+                                for dup_id in existing_ids[1:]:
+                                    execute("DELETE FROM equipment_checklist_records WHERE id = ?", (dup_id,))
                         else:
-                            if not existing.empty:
-                                for old_id in list(existing["id"]):
-                                    execute("DELETE FROM equipment_checklist_records WHERE id = ?", (int(old_id),))
+                            for old_id in existing_ids:
+                                execute("DELETE FROM equipment_checklist_records WHERE id = ?", (old_id,))
 
                     pb_success("Equipment checklist saved to the selected job.")
                     refresh()
