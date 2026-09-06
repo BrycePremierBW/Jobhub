@@ -20575,6 +20575,9 @@ def get_job_stage_options(job_options):
 
 def render_job_purchase_orders_panel(job_id):
     """Manage one or more POs while allowing several stages to share a PO."""
+    if not is_admin():
+        st.info("Purchase orders are visible to admin accounts only.")
+        return
     job_id = int(job_id)
     purchase_orders = job_purchase_orders_dataframe(job_id)
     with st.expander("Purchase orders for this job", expanded=purchase_orders.empty):
