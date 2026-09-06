@@ -24404,10 +24404,27 @@ elif menu == "JobHub AI Assistant":
 
 elif menu == "Builders & Clients":
     st.header("Builders & Clients")
+    # Each section is selected explicitly rather than rendered in eager
+    # Streamlit tabs -- a tabs widget's bodies all execute on every rerun
+    # regardless of which tab is visible, so every one of this page's five
+    # sections used to run its own builders_clients query on every single
+    # load. A radio with a key persists its selection across reruns
+    # natively (unlike a tabs widget, which needed
+    # navigation_state_guard's rerun-restore workaround for the same
+    # reason), so this needs no additional persistence guard
+    # (jobhub-audit-2026-09, JH-PERF-JOBS-001 follow-up; the same class of
+    # fix already built and tested once for this page in the now-dead
+    # jobhub/pages/builders_clients.py, never ported into this production
+    # path).
+    section = st.radio(
+        "Builders & Clients section",
+        ["Add", "Edit", "Remove", "Merge", "List"],
+        horizontal=True,
+        key="builders_clients_section",
+        label_visibility="collapsed",
+    )
 
-    tab_add, tab_edit, tab_remove, tab_merge, tab_list = st.tabs(["Add", "Edit", "Remove", "Merge", "List"])
-
-    with tab_add:
+    if section == "Add":
         st.subheader("Add Builder / Client")
         with st.form("add_builder_form"):
             col1, col2 = st.columns(2)
@@ -24446,7 +24463,7 @@ elif menu == "Builders & Clients":
                     except Exception:
                         pb_error("The builder/client could not be saved. Check for an existing duplicate.")
 
-    with tab_edit:
+    elif section == "Edit":
         st.subheader("Edit Builder / Client")
         builders_df = df_query("SELECT * FROM builders_clients ORDER BY name")
         if builders_df.empty:
@@ -24492,7 +24509,7 @@ elif menu == "Builders & Clients":
                     pb_success(f"Updated {name}")
                     refresh()
 
-    with tab_remove:
+    elif section == "Remove":
         st.subheader("Remove Builder / Client")
         st.warning("If this builder/client has jobs linked, they cannot be deleted until the jobs are changed or archived.")
         builders_df = df_query("SELECT id, name FROM builders_clients ORDER BY name")
@@ -24521,7 +24538,7 @@ elif menu == "Builders & Clients":
                     pb_success("Builder/client deleted.")
                     refresh()
 
-    with tab_merge:
+    elif section == "Merge":
         st.subheader("Merge Duplicate Contacts")
         st.caption(
             "Keep one primary record, transfer every linked job from the selected duplicates, "
@@ -24665,7 +24682,7 @@ elif menu == "Builders & Clients":
             else:
                 st.info("Choose one or more duplicate contacts to preview and merge.")
 
-    with tab_list:
+    elif section == "List":
         st.subheader("Builder & Client List")
         df = df_query("""
             SELECT type AS 'Type',
