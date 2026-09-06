@@ -95,6 +95,9 @@ separate PlanReader 3D tool.
 | 10 | Port lazy-section-selector fix: Job Register | [#127](https://github.com/BrycePremierBW/Jobhub/pull/127) | Merged, verified |
 | 10 | Port lazy-section-selector fix: Builders & Clients | [#128](https://github.com/BrycePremierBW/Jobhub/pull/128) | Merged, verified |
 | 10 | Port lazy-section-selector fix: Equipment | [#130](https://github.com/BrycePremierBW/Jobhub/pull/130) | Merged, verified |
+| 10 | Equipment checklist save N+1 read-side fix | [#132](https://github.com/BrycePremierBW/Jobhub/pull/132) | Merged, verified |
+| 1/2/3 | Procurement reconciliation for `enterprise_job_cost_dataframe()` | [#133](https://github.com/BrycePremierBW/Jobhub/pull/133) | Merged, verified |
+| 9 | Multi-tenant Phase 1: bootstrap org schema at core startup | [#134](https://github.com/BrycePremierBW/Jobhub/pull/134) | Merged, verified |
 | 11 | Palm Lakes migration | **BLOCKED — do not touch** | N/A |
 
 **Note on PR #99.** While checking for other open PRs, found
@@ -112,10 +115,12 @@ from a week-old abandoned PR. #99 has not been closed -- that's the
 user's own PR to close or keep; flagged here rather than acted on.
 
 **Follow-ups identified but not yet actioned (queued):**
-- The Job Equipment Checklist N+1 write-batching described above (real,
-  live, but a write-path change -- needs its own REPRODUCE with a real
-  row-count/timing measurement before touching it, per PR #99's
-  description as a starting lead, re-verified against current code).
+- The Job Equipment Checklist N+1 **write**-batching (PR #99's other
+  half -- batching the INSERT/UPDATE/DELETE calls themselves with
+  `execute_many`). #132 fixed the read-side redundant per-item SELECT;
+  the write side remains a separate, real, live pattern that needs its
+  own REPRODUCE with a real row-count/timing measurement before
+  touching it, since it's a write-path change to production data.
 - Removal of the 19 dead `jobhub/pages`/sibling modules themselves is
   still deferred, per decision #10's own ordering, until the *rest* of
   their contents (beyond the three lazy-render fixes already ported in
@@ -123,18 +128,13 @@ user's own PR to close or keep; flagged here rather than acted on.
   git "fix" history specifically and found only those; it did not rule
   out other value in the remaining ~17 files (see
   `docs/DEAD_CODE_INVENTORY_DECISION_10.md` section 5).
-- `enterprise_job_cost_dataframe()` in `jobhub_enterprise.py` still uses
-  a `max()`-blend of material_entries/Procurement values rather than the
-  additive PO-link-exclusion reconciliation applied to
-  `job_cost_summary_dataframe()`/`pb_job_cost_frame()` in #122. Not
-  currently under-reporting, but not yet strictly Procurement-authoritative
-  per decision #1's letter. Natural to pair with the dead-code
-  consolidation work above (three job-cost implementations exist across
-  two files).
-- Decision #9's design is written; no phase of the actual multi-tenant
-  migration has been implemented. Phase 1 (move `ensure_organization_schema()`
-  out of the Xero-only lazy call site into core startup) is the
-  recommended next step whenever this is picked up.
+- Decision #9's design is written and Phase 1 (tenant-metadata bootstrap
+  at core startup) is now live (#134). Phase 2 onward (organisation_id
+  on app_users, then the ~25 business-data tables, then enforcement, then
+  the actual onboarding flow) has not been started -- see
+  `docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md` for the full phased
+  plan. Do not create a second `organizations` row in production before
+  Phase 4 (enforcement) is complete for every table that needs it.
 
 ---
 
@@ -614,3 +614,97 @@ routes.
 
 **PR.** [#130](https://github.com/BrycePremierBW/Jobhub/pull/130) —
 merged, post-merge CI verified green.
+
+### 2026-09-06 — Decision #10 follow-up: Equipment checklist save N+1 (read side)
+
+**Reproduce.** The Job Equipment Checklist save handler already loaded
+every existing `equipment_checklist_records` row for the selected job
+once, up front, into `existing_by_item`, purely for form default values.
+Inside `if submitted:`, it then re-ran
+`SELECT id FROM equipment_checklist_records WHERE job_id = ? AND
+checklist_item_id = ?` again for every single checklist item -- a
+checklist that can easily have dozens of items. Wrote
+`tests/test_equipment_checklist_save_n_plus_one.py`, driving a submitted
+save with two items (one with an existing record, one without);
+confirmed exactly 2 redundant per-item SELECTs against pre-fix code.
+
+**Fix.** Added `existing_ids_by_item`, built from the same `existing_df`
+query (now `ORDER BY id ASC`, matching the old per-row query's own
+ordering so the "keep the lowest id, delete the rest" duplicate-cleanup
+logic sees identical results). The save loop now looks up each item's
+existing id(s) from this dict instead of re-querying. Zero write
+statements changed -- this is the read-side half only. The write-side
+batching PR #99 also describes (`execute_many` for the INSERT/UPDATE/
+DELETE calls) is deliberately deferred as its own follow-up.
+
+**Tests.** `tests/test_equipment_checklist_save_n_plus_one.py` -- zero
+per-item SELECTs after the fix, same single INSERT (new item) and single
+UPDATE (existing item, correct id) as before. Full suite: 719 tests
+green. Ruff clean. Smoke test renders all 33 routes.
+`tests/run_stage_control_ci.py` still passes.
+
+**PR.** [#132](https://github.com/BrycePremierBW/Jobhub/pull/132) —
+merged, post-merge CI verified green.
+
+### 2026-09-06 — Decisions #1/#2/#3 follow-up: enterprise_job_cost_dataframe() reconciliation
+
+**Reproduce.** The last of three job-cost implementations still not
+Procurement-authoritative: `enterprise_job_cost_dataframe()` (the "Live
+Job Control & Forecast-to-Complete" page) computed
+`Actual Material Cost = max(received_material_cost, supplier_invoiced)`
+and `Material Commitment` as a 6-way `max()` across
+material_entries-derived and Procurement-derived figures. Wrote
+`tests/test_enterprise_job_cost_procurement_reconciliation.py`; all 3
+tests fail against pre-fix code (e.g. a PO-linked material line's
+qty*price and its PO's own, different, subtotal both fed the same
+max(), so the PO's own adjusted subtotal was never actually reflected
+whenever material_entries' number happened to be bigger).
+
+**Fix.** Same PO-link-exclusion pattern as #122: the `materials` query
+now excludes rows linked to an active PO, and the formula is additive:
+`Actual Material Cost = supplier_invoiced + non-PO received cost`,
+`Procurement Committed Material Cost = po_committed + non-PO committed
+cost`, `Material Commitment = max(Budget Materials, Procurement
+Committed Material Cost)` (Budget Materials stays a floor -- a distinct
+estimate concept, not a duplicate commercial truth). Fixed a bystander
+break in `tests/test_material_price_snapshot.py` (from #121), which
+extracted this same query directly and needed the new
+`purchase_orders`/`purchase_order_lines` fixture tables plus updated
+column names.
+
+**Tests.** `tests/test_enterprise_job_cost_procurement_reconciliation.py`
+(3 tests) plus the repaired `test_material_price_snapshot.py` (6/6).
+Full suite: 722 tests green. Ruff clean. Smoke test renders all 33
+routes including the Live Job Control page.
+
+**PR.** [#133](https://github.com/BrycePremierBW/Jobhub/pull/133) —
+merged, post-merge CI verified green. This closes the Job
+Costs/Procurement reconciliation thread across all three job-cost
+implementations in the codebase.
+
+### 2026-09-06 — Decision #9 Phase 1: bootstrap organisation schema at core startup
+
+**Reproduce.** `ensure_organization_schema()` was only called from
+`jobhub/xero_setup_guard.py`, lazily, the first time Xero setup was
+opened. Manually verified via a fresh process with an isolated `DATA_DIR`
+that `initialise_jobhub_runtime()` alone left the `organizations` table
+absent (`sqlite3.OperationalError: no such table: organizations`).
+
+**Fix.** Added the same call to `initialise_jobhub_runtime()` right
+after `init_db()` (so `app_settings` exists first). Additive and
+idempotent, safe to also still run from Xero setup.
+
+**Tests.** New `tests/run_organization_schema_startup_check.py` -- must
+run as its own process (like `material_order_workflow_test.py`/
+`run_stage_control_ci.py`), not a pytest-collected function, because
+`pb_jobhub_app.DATA_DIR` is a module-level constant read once at import
+time; a shared-process check could only ever observe whatever database
+an earlier test already initialised, masking the exact gap this check
+exists to catch. Confirmed it fails in a genuinely fresh process without
+the fix. Added its own CI step. Full suite unaffected (722 tests green,
+the new script intentionally not pytest-collected).
+
+**PR.** [#134](https://github.com/BrycePremierBW/Jobhub/pull/134) —
+merged, post-merge CI verified green. Phase 1 of
+`docs/MULTI_TENANT_ORGANIZATION_SCOPING_DESIGN.md` complete; Phases 2-5
+not started.
