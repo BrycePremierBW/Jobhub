@@ -94,14 +94,33 @@ separate PlanReader 3D tool.
 | 10 | Dead `jobhub/pages` code: prove dead + inventory | [#125](https://github.com/BrycePremierBW/Jobhub/pull/125) | Merged (inventory only) |
 | 10 | Port lazy-section-selector fix: Job Register | [#127](https://github.com/BrycePremierBW/Jobhub/pull/127) | Merged, verified |
 | 10 | Port lazy-section-selector fix: Builders & Clients | [#128](https://github.com/BrycePremierBW/Jobhub/pull/128) | Merged, verified |
+| 10 | Port lazy-section-selector fix: Equipment | [#130](https://github.com/BrycePremierBW/Jobhub/pull/130) | Merged, verified |
 | 11 | Palm Lakes migration | **BLOCKED — do not touch** | N/A |
 
+**Note on PR #99.** While checking for other open PRs, found
+[#99](https://github.com/BrycePremierBW/Jobhub/pull/99) ("Lazy-render
+equipment and batch checklist persistence", opened 2026-08-30, before
+this engagement, still open/unmerged) -- the exact same class of fix as
+#127/#128/#130, but its diff only ever touched the dead
+`jobhub/pages/equipment.py`. #130 supersedes its lazy-tabs portion
+against the live page. #99 also describes batching the Job Equipment
+Checklist save's per-item SELECT+INSERT/UPDATE loop with `execute_many`
+(a real N+1 write pattern, still present today) -- deliberately NOT
+ported in #130 since it's a write-path change to production data that
+deserves independent re-verification against current code, not a copy
+from a week-old abandoned PR. #99 has not been closed -- that's the
+user's own PR to close or keep; flagged here rather than acted on.
+
 **Follow-ups identified but not yet actioned (queued):**
+- The Job Equipment Checklist N+1 write-batching described above (real,
+  live, but a write-path change -- needs its own REPRODUCE with a real
+  row-count/timing measurement before touching it, per PR #99's
+  description as a starting lead, re-verified against current code).
 - Removal of the 19 dead `jobhub/pages`/sibling modules themselves is
   still deferred, per decision #10's own ordering, until the *rest* of
-  their contents (beyond the two lazy-render fixes already ported in
-  #127/#128) has been reviewed -- this session's inventory searched git
-  "fix" history specifically and found only those two; it did not rule
+  their contents (beyond the three lazy-render fixes already ported in
+  #127/#128/#130) has been reviewed -- this session's inventory searched
+  git "fix" history specifically and found only those; it did not rule
   out other value in the remaining ~17 files (see
   `docs/DEAD_CODE_INVENTORY_DECISION_10.md` section 5).
 - `enterprise_job_cost_dataframe()` in `jobhub_enterprise.py` still uses
@@ -555,3 +574,43 @@ renders all 33 routes (including both converted pages) after each PR.
 **PR.** [#127](https://github.com/BrycePremierBW/Jobhub/pull/127) (Job
 Register), [#128](https://github.com/BrycePremierBW/Jobhub/pull/128)
 (Builders & Clients) — both merged, post-merge CI verified green.
+
+### 2026-09-06 — Decision #10 follow-up: port lazy-section-selector to Equipment
+
+**Reproduce.** While checking for other open PRs against this repo,
+found [#99](https://github.com/BrycePremierBW/Jobhub/pull/99)
+("Lazy-render equipment and batch checklist persistence", opened
+2026-08-30, before this engagement, still open) -- the same class of fix
+as the two above, drafted once against the dead
+`jobhub/pages/equipment.py`, never ported into `pb_jobhub_app.py`.
+Confirmed the live `elif menu == "Equipment":` still used eager
+`st.tabs()` across five sections with `get_job_options()` computed once
+at the top for all of them. Wrote `tests/test_equipment_lazy_sections.py`;
+all 6 assertions fail against pre-fix code (`st.tabs()` unpack shape
+mismatch against the new lazy-selector fakes, same signature as the
+Job Register/Builders & Clients reproductions).
+
+**Fix.** Same mechanical header-only conversion as #127/#128:
+`st.tabs([...])` + `with tab_x:` to
+`st.radio(key="equipment_section", ...)` + `if/elif section == "...":`.
+`get_job_options()` now runs only inside the three sections that use it
+(Import Filled PDF Checklist, Job Equipment Checklist, Job Equipment
+Master List). Removed the now-dead Equipment entry from
+`navigation_state_guard._TRACKED_TAB_SETS`.
+**Deliberately did not port** PR #99's other change -- batching the Job
+Equipment Checklist save's per-item SELECT+INSERT/UPDATE loop with
+`execute_many` (a real N+1 write pattern, confirmed still present in the
+live `form_submit_button` handler today). That's a write-path change to
+production data; importing it from a week-old, never-independently-
+verified PR would be exactly the shortcut this programme exists to
+avoid. Recorded as an explicit, separate follow-up above. PR #99 itself
+was not closed -- it's the user's own PR and that decision is theirs.
+
+**Tests.** `tests/test_equipment_lazy_sections.py` (6 tests) all pass
+against the fix, all fail against pre-fix code.
+`test_navigation_tab_coverage.py` (3/3) confirms the guard list stays in
+sync. Full suite: 718 tests green. Ruff clean. Smoke test renders all 33
+routes.
+
+**PR.** [#130](https://github.com/BrycePremierBW/Jobhub/pull/130) —
+merged, post-merge CI verified green.
